@@ -42,10 +42,16 @@ dropped from the Slack summary — it's still in the log file).
 ## Step 2 — Build the Slack message
 
 Use the inline Python below (no extra deps) to turn the JSON into a Slack
-Block Kit payload: one fixed-width code block with **metrics as rows** and
-**periods as columns** (Yesterday / 7d / MTD), plus a `Δ Y vs 7d` column.
-Rates that move ≥ 2pp in the worse direction vs. the 7-day baseline are
-marked with a trailing `!` and called out above the table.
+Block Kit payload: a compact body with three parts —
+
+1. **Headline** with the run date.
+2. **Highlights** section (rendered with bold mrkdwn, so it pops): one bullet
+   per rate that moved ≥ 2pp in the worse direction vs. the 7-day baseline.
+   If nothing crossed the threshold, a green-check confirmation line instead.
+3. **Table** in a fixed-width code block (metrics as rows, `Y` / `7d` as
+   columns, plus a `Δ` column). Rate values carry `%`; deltas carry `pp`.
+   MTD is dropped from the Slack message to keep the table phone-friendly —
+   it's still in the committed log JSON.
 
 ```bash
 python3 - "$OUT" "$RUN_DATE" > logs/"${RUN_DATE}_try_funnel.slack.json" <<'PY'
@@ -59,34 +65,35 @@ def row(prefix):
             return r
     return None
 
-y, w, mtd = row("P4"), row("P3"), row("P2")
+y, w = row("P4"), row("P3")
 
 THRESHOLD_PP = 2.0
-# (column key in SQL output, display label, good_is_high, is_rate)
+# (SQL column, short label for table, full label for highlights, good_is_high, is_rate)
 METRICS = [
-    ("Auth_Orders",              "Auth orders",           True,  False),
-    ("AO_Rate_Pct",              "AO rate",               True,  True),
-    ("Combined_Auth_Rate_Pct",   "Combined auth rate",    True,  True),
-    ("Shipping_Orders",          "Shipping orders",       True,  False),
-    ("Shipping_Success_Pct",     "Shipping success",      True,  True),
-    ("Shipping_Fraud_Fail_Pct",  "Shipping fraud-fail",   False, True),
-    ("Shipping_Payment_Fail_Pct","Shipping payment-fail", False, True),
+    ("Auth_Orders",              "Auth orders", "Auth orders",        True,  False),
+    ("AO_Rate_Pct",              "AO rate",     "AO rate",            True,  True),
+    ("Combined_Auth_Rate_Pct",   "Comb auth",   "Combined auth rate", True,  True),
+    ("Shipping_Orders",          "Ship orders", "Shipping orders",    True,  False),
+    ("Shipping_Success_Pct",     "Ship succ",   "Shipping success",   True,  True),
+    ("Shipping_Fraud_Fail_Pct",  "Fraud %",     "Fraud %",            False, True),
+    ("Shipping_Payment_Fail_Pct","Pay Fail %",  "Pay Fail %",         False, True),
 ]
-PERIODS = [("Yesterday", y), ("7d baseline", w), ("MTD", mtd)]
+PERIODS = [("Y", y), ("7d", w)]
 
 def getf(r, k):
     if r is None: return None
     v = r.get(k)
-    if v in (None, ""): return None
-    return float(v)
+    return None if v in (None, "") else float(v)
 
 def fmt_val(v, is_rate):
     if v is None: return "—"
-    return f"{v:.2f}" if is_rate else f"{int(v):,}"
+    return f"{v:.2f}%" if is_rate else f"{int(v):,}"
+
+def fmt_delta(d):
+    return "—" if d is None else f"{d:+.2f}pp"
 
 def delta(cur, base):
-    if cur is None or base is None: return None
-    return cur - base
+    return None if (cur is None or base is None) else cur - base
 
 def is_flag(cur, base, good_is_high, is_rate):
     if not is_rate: return False
@@ -95,28 +102,24 @@ def is_flag(cur, base, good_is_high, is_rate):
     worse = (d < 0) if good_is_high else (d > 0)
     return abs(d) >= THRESHOLD_PP and worse
 
-# Build table: one row per metric, columns = Metric | Yesterday | 7d | MTD | Δ
-headers = ["Metric"] + [name for name, _ in PERIODS] + ["Δ Y vs 7d"]
+# Build table + collect flags
+headers = ["Metric"] + [name for name, _ in PERIODS] + ["Δ"]
 table_rows = [headers]
-flag_keys = set()
+flags = []  # list of (full_label, y_val, w_val, d, is_rate)
 
-for key, label, good_is_high, is_rate in METRICS:
-    cur_y = getf(y, key)
-    cur_w = getf(w, key)
-    flagged = is_flag(cur_y, cur_w, good_is_high, is_rate)
-    if flagged: flag_keys.add(key)
+for key, short, full, good_is_high, is_rate in METRICS:
+    cy, cw = getf(y, key), getf(w, key)
+    flagged = is_flag(cy, cw, good_is_high, is_rate)
+    if flagged:
+        flags.append((full, cy, cw, delta(cy, cw)))
 
-    cells = [label]
+    cells = [short]
     for _, r in PERIODS:
-        v = getf(r, key)
-        s = fmt_val(v, is_rate)
-        # flag marker on Yesterday cell
+        s = fmt_val(getf(r, key), is_rate)
         if r is y and flagged: s += "!"
         cells.append(s)
-    # Δ column: rates only
     if is_rate:
-        d = delta(cur_y, cur_w)
-        s = "—" if d is None else f"{d:+.2f}"
+        s = fmt_delta(delta(cy, cw))
         if flagged: s += "!"
     else:
         s = "—"
@@ -128,23 +131,22 @@ def render_row(cells):
     out = [cells[0].ljust(col_widths[0])]
     out += [cells[i].rjust(col_widths[i]) for i in range(1, len(cells))]
     return "  ".join(out)
-
 table = "\n".join(render_row(r) for r in table_rows)
 
-# Headline summary
-flag_label_by_key = {k: lbl for k, lbl, _, _ in METRICS}
-if flag_keys:
-    parts = []
-    for k in flag_keys:
-        d = delta(getf(y, k), getf(w, k))
-        parts.append(f"{flag_label_by_key[k]} {d:+.2f}pp")
-    headline = f":rotating_light: *{len(flag_keys)} flag(s) vs 7d:* " + "; ".join(parts)
+# Highlights block (mrkdwn bold — renders outside the code block)
+if flags:
+    header = f":rotating_light: *{len(flags)} significant change(s) vs 7d baseline:*"
+    bullets = "\n".join(
+        f"• *{name}:* Yday `{fy:.2f}%` vs 7d `{fw:.2f}%` → *{d:+.2f}pp*"
+        for (name, fy, fw, d) in flags
+    )
+    highlights = f"{header}\n{bullets}"
 else:
-    headline = ":white_check_mark: No metrics crossed the 2pp threshold vs. 7d."
+    highlights = ":white_check_mark: No metrics crossed the 2pp threshold vs. 7d."
 
 body = (
     f"*TRY funnel — daily monitoring* · {run_date} (Asia/Jerusalem)\n"
-    f"{headline}\n"
+    f"{highlights}\n"
     f"```\n{table}\n```\n"
     f"_`!` marks a rate moving ≥ 2pp in the worse direction vs. the 7-day baseline. "
     f"Source: `maelys-data.spreedly.transactions_s`._"

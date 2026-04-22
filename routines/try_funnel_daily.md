@@ -42,9 +42,10 @@ dropped from the Slack summary — it's still in the log file).
 ## Step 2 — Build the Slack message
 
 Use the inline Python below (no extra deps) to turn the JSON into a Slack
-Block Kit payload: one fixed-width code block showing Yesterday / 7d / MTD
-plus a `Δ Y vs 7d` row. Rates that move ≥ 2pp in the worse direction vs. the
-7-day baseline are marked with a trailing `!` and called out above the table.
+Block Kit payload: one fixed-width code block with **metrics as rows** and
+**periods as columns** (Yesterday / 7d / MTD), plus a `Δ Y vs 7d` column.
+Rates that move ≥ 2pp in the worse direction vs. the 7-day baseline are
+marked with a trailing `!` and called out above the table.
 
 ```bash
 python3 - "$OUT" "$RUN_DATE" > logs/"${RUN_DATE}_try_funnel.slack.json" <<'PY'
@@ -61,17 +62,17 @@ def row(prefix):
 y, w, mtd = row("P4"), row("P3"), row("P2")
 
 THRESHOLD_PP = 2.0
-# metric key -> (header label, good_is_high)
+# (column key in SQL output, display label, good_is_high, is_rate)
 METRICS = [
-    ("Auth_Orders",              "Auth",   True),
-    ("AO_Rate_Pct",              "AO%",    True),
-    ("Combined_Auth_Rate_Pct",   "Comb%",  True),
-    ("Shipping_Orders",          "Ship",   True),
-    ("Shipping_Success_Pct",     "Succ%",  True),
-    ("Shipping_Fraud_Fail_Pct",  "Fraud%", False),
-    ("Shipping_Payment_Fail_Pct","Pay%",   False),
+    ("Auth_Orders",              "Auth orders",           True,  False),
+    ("AO_Rate_Pct",              "AO rate",               True,  True),
+    ("Combined_Auth_Rate_Pct",   "Combined auth rate",    True,  True),
+    ("Shipping_Orders",          "Shipping orders",       True,  False),
+    ("Shipping_Success_Pct",     "Shipping success",      True,  True),
+    ("Shipping_Fraud_Fail_Pct",  "Shipping fraud-fail",   False, True),
+    ("Shipping_Payment_Fail_Pct","Shipping payment-fail", False, True),
 ]
-RATE_KEYS = {k for k,_,_ in METRICS if k.endswith("_Pct")}
+PERIODS = [("Yesterday", y), ("7d baseline", w), ("MTD", mtd)]
 
 def getf(r, k):
     if r is None: return None
@@ -79,81 +80,64 @@ def getf(r, k):
     if v in (None, ""): return None
     return float(v)
 
-def fmt(r, k):
-    v = getf(r, k)
+def fmt_val(v, is_rate):
     if v is None: return "—"
-    return f"{int(v):,}" if k.endswith("_Orders") else f"{v:.2f}"
+    return f"{v:.2f}" if is_rate else f"{int(v):,}"
 
 def delta(cur, base):
     if cur is None or base is None: return None
     return cur - base
 
-def is_flag(key, cur, base, good_is_high):
+def is_flag(cur, base, good_is_high, is_rate):
+    if not is_rate: return False
     d = delta(cur, base)
     if d is None: return False
     worse = (d < 0) if good_is_high else (d > 0)
     return abs(d) >= THRESHOLD_PP and worse
 
-# Build table rows as lists of strings
-WIDTHS = {"period": 12}
-headers = ["Period"] + [label for _, label, _ in METRICS]
-def build_row(label, r, flag_keys=None):
-    flag_keys = flag_keys or set()
-    cells = [label]
-    for k, _, _ in METRICS:
-        s = fmt(r, k)
-        if k in flag_keys: s += "!"
-        cells.append(s)
-    return cells
-
-# Flags on Yesterday row + delta row (same set)
+# Build table: one row per metric, columns = Metric | Yesterday | 7d | MTD | Δ
+headers = ["Metric"] + [name for name, _ in PERIODS] + ["Δ Y vs 7d"]
+table_rows = [headers]
 flag_keys = set()
-for k, _, good_is_high in METRICS:
-    if k not in RATE_KEYS: continue
-    if is_flag(k, getf(y, k), getf(w, k), good_is_high):
-        flag_keys.add(k)
 
-delta_cells = ["Δ Y vs 7d"]
-for k, _, _ in METRICS:
-    if k not in RATE_KEYS:
-        delta_cells.append("—")
-        continue
-    d = delta(getf(y, k), getf(w, k))
-    s = "—" if d is None else f"{d:+.2f}"
-    if k in flag_keys: s += "!"
-    delta_cells.append(s)
+for key, label, good_is_high, is_rate in METRICS:
+    cur_y = getf(y, key)
+    cur_w = getf(w, key)
+    flagged = is_flag(cur_y, cur_w, good_is_high, is_rate)
+    if flagged: flag_keys.add(key)
 
-table_rows = [
-    headers,
-    build_row("Yesterday",   y, flag_keys),
-    build_row("7d baseline", w),
-    build_row("MTD",         mtd),
-    delta_cells,
-]
+    cells = [label]
+    for _, r in PERIODS:
+        v = getf(r, key)
+        s = fmt_val(v, is_rate)
+        # flag marker on Yesterday cell
+        if r is y and flagged: s += "!"
+        cells.append(s)
+    # Δ column: rates only
+    if is_rate:
+        d = delta(cur_y, cur_w)
+        s = "—" if d is None else f"{d:+.2f}"
+        if flagged: s += "!"
+    else:
+        s = "—"
+    cells.append(s)
+    table_rows.append(cells)
 
-# Column widths: max of any cell, with sensible minima
 col_widths = [max(len(r[i]) for r in table_rows) for i in range(len(headers))]
 def render_row(cells):
-    # first col left-aligned, rest right-aligned
     out = [cells[0].ljust(col_widths[0])]
     out += [cells[i].rjust(col_widths[i]) for i in range(1, len(cells))]
     return "  ".join(out)
 
 table = "\n".join(render_row(r) for r in table_rows)
 
-# Headline line above the block
-flag_labels = {
-    "AO_Rate_Pct": "AO",
-    "Combined_Auth_Rate_Pct": "Combined auth",
-    "Shipping_Success_Pct": "Shipping success",
-    "Shipping_Fraud_Fail_Pct": "Shipping fraud-fail",
-    "Shipping_Payment_Fail_Pct": "Shipping payment-fail",
-}
+# Headline summary
+flag_label_by_key = {k: lbl for k, lbl, _, _ in METRICS}
 if flag_keys:
     parts = []
     for k in flag_keys:
         d = delta(getf(y, k), getf(w, k))
-        parts.append(f"{flag_labels[k]} {d:+.2f}pp")
+        parts.append(f"{flag_label_by_key[k]} {d:+.2f}pp")
     headline = f":rotating_light: *{len(flag_keys)} flag(s) vs 7d:* " + "; ".join(parts)
 else:
     headline = ":white_check_mark: No metrics crossed the 2pp threshold vs. 7d."

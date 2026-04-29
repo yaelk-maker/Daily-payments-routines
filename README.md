@@ -1,6 +1,15 @@
 # Daily-payments-routines
 
-Daily monitoring of the TRY payment funnel (Auth + Shipping), posted to `#payments-daily-monitoring`.
+Daily monitoring of the TRY payment funnel (Spreedly + PayPal), posted to `#payments-daily-monitoring`.
+
+## Sources
+
+| Provider | Table | Auth stage | Shipping stage |
+|---|---|---|---|
+| Spreedly | `maelys-data.spreedly.transactions_s` | AUTH_ORIGINAL + AUTH_MODIFIED | CAPTURE_SHIPPING |
+| PayPal | `cdc.PaymentTransactions_v` (EcType `PayPal*`) | TransactionType=7 (Authorize) | TransactionType=0 (Receipt) < $10 |
+
+PayPal TRY orders are identified via `cdc.OrdersNew_v` (OrderType=1, SitePart NOT IN (10,12)).
 
 ## How to run
 
@@ -12,7 +21,7 @@ Daily monitoring of the TRY payment funnel (Auth + Shipping), posted to `#paymen
 ```
 **TRY Funnel Daily Monitoring — YYYY-MM-DD**
 
-**AUTH**
+**AUTH — Spreedly**
 | Period | Orders | AO Rate | Combined Rate |
 |---|---|---|---|
 | Yesterday | … | …% | …% |
@@ -20,13 +29,30 @@ Daily monitoring of the TRY payment funnel (Auth + Shipping), posted to `#paymen
 | MTD | … | …% | …% |
 | Prev month | … | …% | …% |
 
-**SHIPPING**
+**AUTH — PayPal**
+| Period | Orders | Auth Rate |
+|---|---|---|
+| Yesterday | … | …% |
+| Last 7d | … | …% |
+| MTD | … | …% |
+| Prev month | … | …% |
+
+**SHIPPING — Spreedly**
 | Period | Orders | Success | Fraud Fail | Payment Fail |
 |---|---|---|---|---|
 | Yesterday | … | …% | …% | …% |
 | Last 7d | … | …% | …% | …% |
 | MTD | … | …% | …% | …% |
 | Prev month | … | …% | …% | …% |
+
+**SHIPPING — PayPal**
+| Period | Orders | Success |
+|---|---|---|
+| Yesterday | … | …% |
+| Last 7d | … | …% |
+| MTD | … | …% |
+| Prev month | … | …% |
 ```
 
-The AUTH and SHIPPING tables are kept separate so each fits on a mobile screen without horizontal scrolling.
+Each table is kept narrow so it fits on a mobile screen without horizontal scrolling.
+PayPal shipping has no fraud split (no fraud declines for PP).

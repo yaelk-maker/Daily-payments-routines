@@ -9,7 +9,8 @@
 -- Methodology:
 --   TRY Auth/Shipping — aligned with Redash #1610 (TBYB Success Rate Timeline)
 --     - QUALIFY MAX(TransactionType)=7 for TRY order identification
---     - PP AUTH_MODIFIED via window function; PP shipping includes CAPTURE_FOLLOW_UP
+--     - PP AUTH_MODIFIED via window function (failed AO + lower amount)
+--     - Shipping = CAPTURE_SHIPPING only (CAPTURE_FOLLOW_UP/FORCE_CAPTURE excluded)
 --     - CC fraud-blocked excluded from shipping denominator
 --     - Apple Pay $0-amount auth attempts excluded (matching #1610)
 --     - Date attribution: DATE(TransactionTime), matching #1610 (no TZ conversion)
@@ -102,15 +103,15 @@ try_auth_order AS (
 ),
 try_auth_pivot AS (
   SELECT period, sort_order,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND auth_success=1), COUNTIF(pmt_method='Credit Card' AND ao_attempt=1))*100, 1) AS CC,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND auth_success=1), COUNTIF(pmt_method='Apple Pay'   AND ao_attempt=1))*100, 1) AS AP,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND auth_success=1), COUNTIF(pmt_method='PayPal'      AND ao_attempt=1))*100, 1) AS PP
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND auth_success=1), COUNTIF(pmt_method='Credit Card' AND ao_attempt=1))*100, 2) AS CC,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND auth_success=1), COUNTIF(pmt_method='Apple Pay'   AND ao_attempt=1))*100, 2) AS AP,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND auth_success=1), COUNTIF(pmt_method='PayPal'      AND ao_attempt=1))*100, 2) AS PP
   FROM try_auth_order GROUP BY period, sort_order
 ),
 try_auth_overall AS (
   SELECT period, sort_order,
     COUNTIF(ao_attempt=1)                                                                    AS total_attempts,
-    ROUND(SAFE_DIVIDE(COUNTIF(ao_attempt=1 AND auth_success=1), COUNTIF(ao_attempt=1))*100, 1) AS overall_rate
+    ROUND(SAFE_DIVIDE(COUNTIF(ao_attempt=1 AND auth_success=1), COUNTIF(ao_attempt=1))*100, 2) AS overall_rate
   FROM (
     SELECT period, sort_order, OrderID,
       MAX(ao_attempt) AS ao_attempt, MAX(auth_success) AS auth_success
@@ -119,27 +120,26 @@ try_auth_overall AS (
   GROUP BY period, sort_order
 ),
 
--- TRY SHIPPING: success / attempts (CC fraud excluded from denom; PP includes CAPTURE_FOLLOW_UP)
+-- TRY SHIPPING: success / attempts on CAPTURE_SHIPPING only (CC fraud excluded from denom)
 try_ship_order AS (
   SELECT period, sort_order, OrderID, pmt_method,
     MAX(CASE WHEN pmt_method!='Credit Card' OR (succeeded OR NOT fraud_flag) THEN 1 ELSE 0 END) AS attempt,
     MAX(CASE WHEN succeeded THEN 1 ELSE 0 END) AS success
   FROM try_tagged
-  WHERE (provider='Spreedly' AND sub_type_final='CAPTURE_SHIPPING')
-     OR (provider='PayPal'   AND TransactionType=0 AND (sub_type_final='CAPTURE_SHIPPING' OR is_pp_followup))
+  WHERE sub_type_final = 'CAPTURE_SHIPPING'
   GROUP BY period, sort_order, OrderID, pmt_method
 ),
 try_ship_pivot AS (
   SELECT period, sort_order,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 1) AS CC,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 1) AS AP,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 1) AS PP
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 2) AS CC,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 2) AS AP,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 2) AS PP
   FROM try_ship_order GROUP BY period, sort_order
 ),
 try_ship_overall AS (
   SELECT period, sort_order,
     COUNTIF(attempt=1)                                                                    AS total_attempts,
-    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 1) AS overall_rate
+    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
   FROM (
     SELECT period, sort_order, OrderID,
       MAX(attempt) AS attempt, MAX(success) AS success
@@ -205,15 +205,15 @@ buy_sub_order AS (
 ),
 buy_pivot AS (
   SELECT period, sort_order,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 1) AS CC,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 1) AS AP,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 1) AS PP
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 2) AS CC,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 2) AS AP,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 2) AS PP
   FROM buy_sub_order WHERE order_type='BUY' GROUP BY period, sort_order
 ),
 buy_overall AS (
   SELECT period, sort_order,
     COUNTIF(attempt=1)                                                                    AS total_attempts,
-    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 1) AS overall_rate
+    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
   FROM (
     SELECT period, sort_order, OrderID,
       MAX(attempt) AS attempt, MAX(success) AS success
@@ -223,15 +223,15 @@ buy_overall AS (
 ),
 sub_pivot AS (
   SELECT period, sort_order,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 1) AS CC,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 1) AS AP,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 1) AS PP
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 2) AS CC,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 2) AS AP,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 2) AS PP
   FROM buy_sub_order WHERE order_type='SUB' GROUP BY period, sort_order
 ),
 sub_overall AS (
   SELECT period, sort_order,
     COUNTIF(attempt=1)                                                                    AS total_attempts,
-    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 1) AS overall_rate
+    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
   FROM (
     SELECT period, sort_order, OrderID,
       MAX(attempt) AS attempt, MAX(success) AS success

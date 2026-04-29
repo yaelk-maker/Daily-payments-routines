@@ -2,14 +2,20 @@
 
 Daily monitoring of the TRY payment funnel (Spreedly + PayPal), posted to `#payments-daily-monitoring`.
 
-## Sources
+## Methodology
 
-| Provider | Table | Auth stage | Shipping stage |
-|---|---|---|---|
-| Spreedly | `maelys-data.spreedly.transactions_s` | AUTH_ORIGINAL + AUTH_MODIFIED | CAPTURE_SHIPPING |
-| PayPal | `cdc.PaymentTransactions_v` (EcType `PayPal*`) | TransactionType=7 (Authorize) | TransactionType=0 (Receipt) < $10 |
+Aligned with **TBYB Success Rate Timeline** (Redash #1610).
 
-PayPal TRY orders are identified via `cdc.OrdersNew_v` (OrderType=1, SitePart NOT IN (10,12)).
+| Choice | Detail |
+|---|---|
+| Source | `cdc.PaymentTransactions_v` LEFT JOIN `spreedly.transaction_report_v` on OrchestratorToken |
+| TRY identification | `QUALIFY MAX(TransactionType) OVER (PARTITION BY OrderID) = 7` — order must have an auth |
+| Zero-amount filter | `sum > 0` — excludes $0 transactions |
+| Date attribution | Order's **first** transaction date (not per-transaction date) |
+| Spreedly success | Prefers Spreedly's `Succeeded`/`Message`; falls back to `IsSuccessful` |
+| PP AUTH_MODIFIED | Window-function detection: prior failed auth + lower amount |
+| PP Shipping | CAPTURE_SHIPPING (Receipt < $10) + CAPTURE_FOLLOW_UP (last Receipt > $10 per order) |
+| SPL Shipping denominator | CC fraud-blocked orders excluded (Apple Pay / PP: all attempts included) |
 
 ## How to run
 
@@ -55,4 +61,4 @@ PayPal TRY orders are identified via `cdc.OrdersNew_v` (OrderType=1, SitePart NO
 ```
 
 Each table is kept narrow so it fits on a mobile screen without horizontal scrolling.
-PayPal shipping has no fraud split (no fraud declines for PP).
+Note: SPL Shipping Fraud Fail will be ~0% — CC fraud-blocked orders are excluded from the denominator per #1610 methodology.

@@ -1,64 +1,76 @@
 # Daily-payments-routines
 
-Daily monitoring of the TRY payment funnel (Spreedly + PayPal), posted to `#payments-daily-monitoring`.
+Daily monitoring of payment success rates across funnels (TRY, BUY, SUB) by payment method, posted to `#payments-daily-monitoring`.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `payment method success rates by funnel.sql` | **Routine query.** High-level success rates for TRY Auth, TRY Shipping, BUY, SUB by payment method (CC / Apple Pay / PayPal). Run daily and post to Slack. |
+| `try funnel daily monitoring.sql` | **Deep-dive query.** Detailed TRY-only breakdown — Spreedly vs PayPal, with AO-vs-Combined Auth split and Fraud-vs-Payment-Fail Shipping split. Run on demand when investigating TRY anomalies; not part of the daily routine. |
 
 ## Methodology
 
-Aligned with **TBYB Success Rate Timeline** (Redash #1610).
+Aligned with the canonical Redash queries:
 
-| Choice | Detail |
-|---|---|
-| Source | `cdc.PaymentTransactions_v` LEFT JOIN `spreedly.transaction_report_v` on OrchestratorToken |
-| TRY identification | `QUALIFY MAX(TransactionType) OVER (PARTITION BY OrderID) = 7` — order must have an auth |
-| Zero-amount filter | `sum > 0` — excludes $0 transactions |
-| Date attribution | Order's **first** transaction date (not per-transaction date) |
-| Spreedly success | Prefers Spreedly's `Succeeded`/`Message`; falls back to `IsSuccessful` |
-| PP AUTH_MODIFIED | Window-function detection: prior failed auth + lower amount |
-| PP Shipping | CAPTURE_SHIPPING (Receipt < $10) + CAPTURE_FOLLOW_UP (last Receipt > $10 per order) |
-| SPL Shipping denominator | CC fraud-blocked orders excluded (Apple Pay / PP: all attempts included) |
+| Funnel | Reference | Notes |
+|---|---|---|
+| TRY Auth, TRY Shipping | Redash #1610 (TBYB Success Rate Timeline) | QUALIFY MAX(TransactionType)=7 for TRY identification; PP AUTH_MODIFIED via window function; PP shipping includes CAPTURE_FOLLOW_UP; CC fraud-blocked excluded from shipping denominator |
+| BUY, SUB | Redash #1613 (BUY Success Rate Timeline) | TransactionType=0 / CAPTURE_FULL; SUB = SitePart IN (10,12) or Spreedly Metadata_order_type='SUB'; CC fraud-blocked excluded |
 
-## How to run
+Common across all funnels:
+- Source: `cdc.PaymentTransactions_v` LEFT JOIN `spreedly.transaction_report_v` on OrchestratorToken
+- `sum > 0` filter (zero-amount transactions excluded)
+- Period attribution: order's first transaction date (Asia/Jerusalem)
+- Order-level deduplication (MAX over flags)
 
-1. Execute `try funnel daily monitoring.sql` in BigQuery (project: `maelys-data`).
-2. Post results to `#payments-daily-monitoring` using the Slack message template below.
+**Note on SUB:** the rate reflects same-day billing success. Orders that fail same-day enter dunning and may succeed on subsequent days, so the SUB rate here is a leading indicator for anomaly detection — not a final renewal rate.
 
-## Slack message template
+## How to run the routine
+
+1. Execute `payment method success rates by funnel.sql` in BigQuery (project: `maelys-data`).
+2. Post results to `#payments-daily-monitoring` using the Slack template below.
+
+## Slack message template (routine)
+
+Each funnel is its own narrow table so it fits on a mobile screen.
 
 ```
-**TRY Funnel Daily Monitoring — YYYY-MM-DD**
+**Payment Success Rates — YYYY-MM-DD**
 
-**AUTH — Spreedly**
-| Period | Orders | AO Rate | Combined Rate |
+**TRY — Auth (Combined AO+AM)**
+| Period | CC | Apple Pay | PayPal |
 |---|---|---|---|
-| Yesterday | … | …% | …% |
-| Last 7d | … | …% | …% |
-| MTD | … | …% | …% |
-| Prev month | … | …% | …% |
+| Yesterday | …% | …% | …% |
+| Last 7d | …% | …% | …% |
+| MTD | …% | …% | …% |
+| Prev month | …% | …% | …% |
 
-**AUTH — PayPal**
-| Period | Orders | Auth Rate |
-|---|---|---|
-| Yesterday | … | …% |
-| Last 7d | … | …% |
-| MTD | … | …% |
-| Prev month | … | …% |
+**TRY — Shipping**
+| Period | CC | Apple Pay | PayPal |
+|---|---|---|---|
+| Yesterday | …% | …% | …% |
+| Last 7d | …% | …% | …% |
+| MTD | …% | …% | …% |
+| Prev month | …% | …% | …% |
 
-**SHIPPING — Spreedly**
-| Period | Orders | Success | Fraud Fail | Payment Fail |
-|---|---|---|---|---|
-| Yesterday | … | …% | …% | …% |
-| Last 7d | … | …% | …% | …% |
-| MTD | … | …% | …% | …% |
-| Prev month | … | …% | …% | …% |
+**BUY**
+| Period | CC | Apple Pay | PayPal |
+|---|---|---|---|
+| Yesterday | …% | …% | …% |
+| Last 7d | …% | …% | …% |
+| MTD | …% | …% | …% |
+| Prev month | …% | …% | …% |
 
-**SHIPPING — PayPal**
-| Period | Orders | Success |
-|---|---|---|
-| Yesterday | … | …% |
-| Last 7d | … | …% |
-| MTD | … | …% |
-| Prev month | … | …% |
+**SUB (same-day billing)**
+| Period | CC | Apple Pay | PayPal |
+|---|---|---|---|
+| Yesterday | …% | …% | …% |
+| Last 7d | …% | …% | …% |
+| MTD | …% | …% | …% |
+| Prev month | …% | …% | …% |
 ```
 
-Each table is kept narrow so it fits on a mobile screen without horizontal scrolling.
-Note: SPL Shipping Fraud Fail will be ~0% — CC fraud-blocked orders are excluded from the denominator per #1610 methodology.
+## Deep-dive (on demand)
+
+When the routine flags a TRY anomaly, run `try funnel daily monitoring.sql` for the AO-vs-AM split and the Fraud-vs-Payment-Fail breakdown — useful for diagnosing whether a TRY drop is driven by issuer declines, fraud rules, or PSP issues.

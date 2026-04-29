@@ -1,16 +1,21 @@
 -- ============================================================
 -- TRY FUNNEL DAILY MONITORING QUERY
 -- ============================================================
--- Source: maelys-data.spreedly.transactions_s
--- Output: 4 rows comparing Previous Month | MTD | 7d | Yesterday
--- Stages: AUTH (AO+AM), CAPTURE_SHIPPING
--- Timezone: Asia/Jerusalem (change in params CTE if needed)
+-- Methodology aligned with TBYB Success Rate Timeline (Redash #1610)
+-- Sources:
+--   cdc.PaymentTransactions_v        (all providers)
+--   spreedly.transaction_report_v    (joined via OrchestratorToken for success/sub-type override)
+-- Output: 4 rows — Yesterday | 7d (excl. yesterday) | MTD (excl. yesterday) | Previous month
+-- Timezone: Asia/Jerusalem
 --
--- Methodology (per payment-analysis + try-payments-performance skills):
---   - Order-level success via MAX CASE (equivalent to any())
---   - OrderID suffix stripped to numeric for deduplication
---   - Apple Pay $0 Auth excluded from AUTH population
---   - Shipping failures split: fraud-blocked vs. payment-failed
+-- Key methodology choices (matching #1610):
+--   - TRY orders: QUALIFY MAX(TransactionType)=7 per order (must have an auth)
+--   - sum > 0 filter: zero-amount transactions excluded
+--   - Date attribution: order's first transaction date (not per-transaction date)
+--   - Spreedly success/sub-type: prefer spreedly.transaction_report_v where token matches
+--   - PayPal AUTH_MODIFIED: detected via window function (prior failed auth + lower amount)
+--   - PayPal shipping: CAPTURE_SHIPPING (Receipt < $10) + CAPTURE_FOLLOW_UP (last Receipt > $10)
+--   - Spreedly CC shipping denominator: fraud-blocked CC orders excluded
 -- ============================================================
 
 WITH params AS (
@@ -42,84 +47,179 @@ periods AS (
   FROM params
 ),
 
-raw AS (
+-- ===== UNIFIED BASE =====
+trans_raw AS (
   SELECT
-    REGEXP_EXTRACT(order_id, r'(\d+)') AS order_id_numeric,
-    date,
-    transaction_metadata_sub_transaction_type AS sub_type,
-    LOWER(succeeded) = 'true' AS is_success,
-    LOWER(COALESCE(message, '')) AS msg_lower,
-    payment_method_payment_method_type AS pmt_type,
-    SAFE_CAST(amount AS FLOAT64) AS amt
-  FROM `maelys-data.spreedly.transactions_s`
-  WHERE date >= (SELECT MIN(d_start) FROM periods)
-    AND date <= (SELECT MAX(d_end) FROM periods)
-    AND transaction_metadata_order_type = 'TRY'
-    AND transaction_metadata_sub_transaction_type IN (
-      'AUTH_ORIGINAL', 'AUTH_MODIFIED', 'CAPTURE_SHIPPING'
-    )
+    pt.OrderID,
+    pt.TransactionTime,
+    pt.TransactionType,
+    CASE
+      WHEN s.Succeeded = 'True'  THEN true
+      WHEN s.Succeeded = 'False' THEN false
+      ELSE pt.IsSuccessful
+    END AS succeeded,
+    CASE WHEN IFNULL(LOWER(s.Message), '') LIKE '%fraud%' THEN true ELSE false END AS fraud_flag,
+    COALESCE(
+      s.Metadata_sub_transaction_type,
+      CASE
+        WHEN pt.TransactionType = 7               THEN 'AUTH_ORIGINAL'
+        WHEN pt.TransactionType = 0 AND pt.Sum < 10 THEN 'CAPTURE_SHIPPING'
+        ELSE                                           'CAPTURE_FOLLOW_UP'
+      END
+    ) AS sub_type,
+    CASE WHEN LOWER(pt.EcType) LIKE '%paypal%'   THEN 'PayPal'      ELSE 'Spreedly'    END AS provider,
+    CASE WHEN LOWER(pt.EcType) LIKE '%applepay%' THEN 'ApplePay'    ELSE 'Credit Card' END AS spl_pmt_method,
+    pt.Sum AS amt
+  FROM `cdc.PaymentTransactions_v` pt
+  LEFT JOIN `spreedly.transaction_report_v` s ON pt.OrchestratorToken = s.token
+  WHERE pt.TransactionType IN (0, 7)
+    AND pt.Sum > 0
+  QUALIFY MAX(pt.TransactionType) OVER (PARTITION BY pt.OrderID) = 7
 ),
 
-raw_tagged AS (
-  SELECT r.*, p.period, p.sort_order
-  FROM raw r
-  JOIN periods p ON r.date BETWEEN p.d_start AND p.d_end
+trans AS (
+  SELECT
+    *,
+    MIN(DATE(TIMESTAMP(TransactionTime), 'Asia/Jerusalem')) OVER (PARTITION BY OrderID) AS first_date,
+    -- PayPal AUTH_MODIFIED: prior failed auth exists AND current amount is lower
+    CASE
+      WHEN provider = 'PayPal'
+        AND TransactionType = 7
+        AND sub_type = 'AUTH_ORIGINAL'
+        AND MAX(CASE WHEN TransactionType = 7 AND NOT succeeded THEN 1 ELSE 0 END)
+            OVER (PARTITION BY OrderID ORDER BY TIMESTAMP(TransactionTime)
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) = 1
+        AND amt < FIRST_VALUE(CASE WHEN TransactionType = 7 THEN amt END IGNORE NULLS)
+            OVER (PARTITION BY OrderID ORDER BY TIMESTAMP(TransactionTime)
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+      THEN 'AUTH_MODIFIED'
+      ELSE sub_type
+    END AS sub_type_final,
+    -- PayPal CAPTURE_FOLLOW_UP: last Receipt > $10 per order
+    CASE
+      WHEN provider = 'PayPal'
+        AND TransactionType = 0
+        AND amt > 10
+        AND TIMESTAMP(TransactionTime) = MAX(CASE WHEN TransactionType = 0 AND amt > 10
+            THEN TIMESTAMP(TransactionTime) END) OVER (PARTITION BY OrderID)
+      THEN true
+      ELSE false
+    END AS is_pp_capture_followup
+  FROM trans_raw
 ),
 
--- ========== AUTH (exclude Apple Pay $0) ==========
-auth_order_level AS (
-  SELECT
-    period, sort_order, order_id_numeric,
-    MAX(CASE WHEN sub_type = 'AUTH_ORIGINAL' AND is_success THEN 1 ELSE 0 END) AS ao_success,
-    MAX(CASE WHEN sub_type = 'AUTH_MODIFIED'  AND is_success THEN 1 ELSE 0 END) AS am_success
-  FROM raw_tagged
-  WHERE sub_type IN ('AUTH_ORIGINAL', 'AUTH_MODIFIED')
-    AND NOT (pmt_type = 'apple_pay' AND COALESCE(amt, 0) = 0)
-    AND order_id_numeric IS NOT NULL
-  GROUP BY period, sort_order, order_id_numeric
+trans_tagged AS (
+  SELECT t.*, p.period, p.sort_order
+  FROM trans t
+  JOIN periods p ON t.first_date BETWEEN p.d_start AND p.d_end
 ),
-auth_agg AS (
+
+-- ===== SPREEDLY AUTH =====
+spl_auth_orders AS (
+  SELECT
+    period, sort_order, OrderID,
+    MAX(CASE WHEN sub_type_final = 'AUTH_ORIGINAL'                      THEN 1 ELSE 0 END) AS ao_attempt,
+    MAX(CASE WHEN sub_type_final = 'AUTH_ORIGINAL' AND     succeeded    THEN 1 ELSE 0 END) AS ao_success,
+    MAX(CASE WHEN sub_type_final = 'AUTH_MODIFIED'  AND     succeeded    THEN 1 ELSE 0 END) AS am_success
+  FROM trans_tagged
+  WHERE provider = 'Spreedly'
+    AND TransactionType = 7
+    AND sub_type_final IN ('AUTH_ORIGINAL', 'AUTH_MODIFIED')
+  GROUP BY period, sort_order, OrderID
+),
+spl_auth_agg AS (
   SELECT
     period, sort_order,
-    COUNT(*) AS auth_orders,
-    SUM(ao_success) AS ao_success_orders,
-    SUM(CASE WHEN ao_success = 1 OR am_success = 1 THEN 1 ELSE 0 END) AS combined_pass_orders
-  FROM auth_order_level
+    SUM(ao_attempt)                                                     AS auth_orders,
+    SUM(ao_success)                                                     AS ao_success_orders,
+    SUM(CASE WHEN ao_success = 1 OR am_success = 1 THEN 1 ELSE 0 END)  AS combined_pass_orders
+  FROM spl_auth_orders
   GROUP BY period, sort_order
 ),
 
--- ========== CAPTURE_SHIPPING ==========
-cs_order_level AS (
+-- ===== SPREEDLY SHIPPING =====
+-- CC fraud-blocked orders are excluded from the denominator (matching #1610)
+spl_ship_orders AS (
   SELECT
-    period, sort_order, order_id_numeric,
-    MAX(CASE WHEN is_success THEN 1 ELSE 0 END) AS succeeded,
-    MAX(CASE WHEN NOT is_success AND STRPOS(msg_lower, 'fraud check') > 0 THEN 1 ELSE 0 END) AS had_fraud_fail
-  FROM raw_tagged
-  WHERE sub_type = 'CAPTURE_SHIPPING' AND order_id_numeric IS NOT NULL
-  GROUP BY period, sort_order, order_id_numeric
+    period, sort_order, OrderID,
+    MAX(CASE WHEN spl_pmt_method != 'Credit Card' OR (succeeded OR NOT fraud_flag) THEN 1 ELSE 0 END) AS ship_attempt,
+    MAX(CASE WHEN     succeeded                                         THEN 1 ELSE 0 END) AS ship_success,
+    MAX(CASE WHEN NOT succeeded AND     fraud_flag                      THEN 1 ELSE 0 END) AS fraud_blocked
+  FROM trans_tagged
+  WHERE provider = 'Spreedly'
+    AND sub_type_final = 'CAPTURE_SHIPPING'
+  GROUP BY period, sort_order, OrderID
 ),
-cs_agg AS (
+spl_ship_agg AS (
   SELECT
     period, sort_order,
-    COUNT(*) AS shipping_orders,
-    SUM(succeeded) AS shipping_success_orders,
-    SUM(CASE WHEN succeeded = 0 AND had_fraud_fail = 1 THEN 1 ELSE 0 END) AS fraud_blocked,
-    SUM(CASE WHEN succeeded = 0 AND had_fraud_fail = 0 THEN 1 ELSE 0 END) AS payment_fail
-  FROM cs_order_level
+    SUM(ship_attempt)                                                                               AS shipping_orders,
+    SUM(CASE WHEN ship_attempt=1 AND ship_success=1                      THEN 1 ELSE 0 END)          AS shipping_success_orders,
+    SUM(CASE WHEN ship_attempt=1 AND ship_success=0 AND fraud_blocked=1  THEN 1 ELSE 0 END)          AS fraud_blocked_orders,
+    SUM(CASE WHEN ship_attempt=1 AND ship_success=0 AND fraud_blocked=0  THEN 1 ELSE 0 END)          AS payment_fail_orders
+  FROM spl_ship_orders
+  GROUP BY period, sort_order
+),
+
+-- ===== PAYPAL AUTH =====
+pp_auth_orders AS (
+  SELECT
+    period, sort_order, OrderID,
+    MAX(CASE WHEN sub_type_final IN ('AUTH_ORIGINAL','AUTH_MODIFIED')               THEN 1 ELSE 0 END) AS auth_attempt,
+    MAX(CASE WHEN sub_type_final IN ('AUTH_ORIGINAL','AUTH_MODIFIED') AND succeeded  THEN 1 ELSE 0 END) AS auth_success
+  FROM trans_tagged
+  WHERE provider = 'PayPal'
+    AND TransactionType = 7
+  GROUP BY period, sort_order, OrderID
+),
+pp_auth_agg AS (
+  SELECT period, sort_order,
+    SUM(auth_attempt) AS pp_auth_orders,
+    SUM(auth_success) AS pp_auth_success_orders
+  FROM pp_auth_orders
+  GROUP BY period, sort_order
+),
+
+-- ===== PAYPAL SHIPPING (CAPTURE_SHIPPING < $10 + CAPTURE_FOLLOW_UP: last Receipt > $10) =====
+pp_ship_orders AS (
+  SELECT
+    period, sort_order, OrderID,
+    MAX(CASE WHEN sub_type_final = 'CAPTURE_SHIPPING' OR is_pp_capture_followup               THEN 1 ELSE 0 END) AS ship_attempt,
+    MAX(CASE WHEN (sub_type_final = 'CAPTURE_SHIPPING' OR is_pp_capture_followup) AND succeeded THEN 1 ELSE 0 END) AS ship_success
+  FROM trans_tagged
+  WHERE provider = 'PayPal'
+    AND TransactionType = 0
+  GROUP BY period, sort_order, OrderID
+),
+pp_ship_agg AS (
+  SELECT period, sort_order,
+    SUM(ship_attempt) AS pp_ship_orders,
+    SUM(ship_success) AS pp_ship_success_orders
+  FROM pp_ship_orders
   GROUP BY period, sort_order
 )
 
--- ========== FINAL OUTPUT ==========
+-- ===== FINAL OUTPUT =====
 SELECT
-  p.period                                                                   AS Period,
-  a.auth_orders                                                              AS Auth_Orders,
-  ROUND(SAFE_DIVIDE(a.ao_success_orders,    a.auth_orders) * 100, 2)         AS AO_Rate_Pct,
-  ROUND(SAFE_DIVIDE(a.combined_pass_orders, a.auth_orders) * 100, 2)         AS Combined_Auth_Rate_Pct,
-  c.shipping_orders                                                          AS Shipping_Orders,
-  ROUND(SAFE_DIVIDE(c.shipping_success_orders, c.shipping_orders) * 100, 2)  AS Shipping_Success_Pct,
-  ROUND(SAFE_DIVIDE(c.fraud_blocked,           c.shipping_orders) * 100, 2)  AS Shipping_Fraud_Fail_Pct,
-  ROUND(SAFE_DIVIDE(c.payment_fail,            c.shipping_orders) * 100, 2)  AS Shipping_Payment_Fail_Pct
+  p.period                                                                          AS Period,
+  -- Spreedly Auth
+  a.auth_orders                                                                     AS SPL_Auth_Orders,
+  ROUND(SAFE_DIVIDE(a.ao_success_orders,    a.auth_orders)    * 100, 2)             AS SPL_AO_Rate_Pct,
+  ROUND(SAFE_DIVIDE(a.combined_pass_orders, a.auth_orders)    * 100, 2)             AS SPL_Combined_Auth_Rate_Pct,
+  -- Spreedly Shipping
+  c.shipping_orders                                                                 AS SPL_Shipping_Orders,
+  ROUND(SAFE_DIVIDE(c.shipping_success_orders, c.shipping_orders) * 100, 2)         AS SPL_Shipping_Success_Pct,
+  ROUND(SAFE_DIVIDE(c.fraud_blocked_orders,    c.shipping_orders) * 100, 2)         AS SPL_Shipping_Fraud_Fail_Pct,
+  ROUND(SAFE_DIVIDE(c.payment_fail_orders,     c.shipping_orders) * 100, 2)         AS SPL_Shipping_Payment_Fail_Pct,
+  -- PayPal Auth
+  pa.pp_auth_orders                                                                 AS PP_Auth_Orders,
+  ROUND(SAFE_DIVIDE(pa.pp_auth_success_orders, pa.pp_auth_orders) * 100, 2)         AS PP_Auth_Rate_Pct,
+  -- PayPal Shipping
+  ps.pp_ship_orders                                                                 AS PP_Shipping_Orders,
+  ROUND(SAFE_DIVIDE(ps.pp_ship_success_orders, ps.pp_ship_orders) * 100, 2)         AS PP_Shipping_Success_Pct
 FROM periods p
-LEFT JOIN auth_agg a USING (period, sort_order)
-LEFT JOIN cs_agg   c USING (period, sort_order)
+LEFT JOIN spl_auth_agg a  USING (period, sort_order)
+LEFT JOIN spl_ship_agg c  USING (period, sort_order)
+LEFT JOIN pp_auth_agg  pa USING (period, sort_order)
+LEFT JOIN pp_ship_agg  ps USING (period, sort_order)
 ORDER BY p.sort_order DESC;

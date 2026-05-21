@@ -1,8 +1,5 @@
 {
   "permissions": {
-    "allow": [
-      "mcp__Google-Cloud-BigQuery__execute_sql_readonly",
-      "mcp__Google-Cloud-BigQuery__execute_sql"
-    ]
+    "defaultMode": "bypassPermissions"
   }
 }

@@ -221,12 +221,21 @@ buy_overall AS (
   )
   GROUP BY period, sort_order
 ),
+-- SUB: restrict to ConsecutiveChargeAttempt=1 (first billing attempt per cycle,
+--   no dunning retries). Source: Redash #1573 / subscriptions.SubscriptionsRecurringOrders_v.
+sub_first_attempt AS (
+  SELECT DISTINCT RecurringOrderId
+  FROM `subscriptions.SubscriptionsRecurringOrders_v`
+  WHERE AttemptsAmount = 1
+),
 sub_pivot AS (
   SELECT period, sort_order,
     ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 2) AS CC,
     ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 2) AS AP,
     ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 2) AS PP
-  FROM buy_sub_order WHERE order_type='SUB' GROUP BY period, sort_order
+  FROM buy_sub_order
+  JOIN sub_first_attempt ON buy_sub_order.OrderID = sub_first_attempt.RecurringOrderId
+  WHERE order_type='SUB' GROUP BY period, sort_order
 ),
 sub_overall AS (
   SELECT period, sort_order,
@@ -235,7 +244,9 @@ sub_overall AS (
   FROM (
     SELECT period, sort_order, OrderID,
       MAX(attempt) AS attempt, MAX(success) AS success
-    FROM buy_sub_order WHERE order_type='SUB' GROUP BY period, sort_order, OrderID
+    FROM buy_sub_order
+    JOIN sub_first_attempt ON buy_sub_order.OrderID = sub_first_attempt.RecurringOrderId
+    WHERE order_type='SUB' GROUP BY period, sort_order, OrderID
   )
   GROUP BY period, sort_order
 )

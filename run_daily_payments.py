@@ -54,10 +54,10 @@ PERIOD_FROM_KEY = {
 }
 METRICS = [("Overall", "Overall"), ("CC", "CC"), ("AP", "Apple Pay"), ("PP", "PayPal")]
 FUNNELS = [
-    ("TryAuth", "TRY Auth"),
-    ("TryShip", "TRY Shipping"),
-    ("Buy",     "BUY"),
-    ("Sub",     "SUB"),
+    ("TryAuth", "TRY Auth",     None),
+    ("TryShip", "TRY Shipping", None),
+    ("Buy",     "BUY",          None),
+    ("Sub",     "SUB",          "first attempt only"),
 ]
 
 # Pink/coral palette
@@ -81,10 +81,12 @@ def tx_for(delta: float) -> str:
     return RED_TX if delta < -0.5 else GREEN_TX
 
 
-def render_funnel(ax, prefix: str, short_title: str, rows: dict) -> None:
+def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = None) -> None:
     ax.axis("off")
     yest_total = rows["Yesterday"][f"{prefix}_Total"]
     title = f"{short_title} - {yest_total:,} attempts yesterday"
+    if note:
+        title += f"  ({note})"
     ax.text(0.5, 1.05, title, ha="center", va="bottom",
             transform=ax.transAxes, fontsize=12, fontweight="bold", color="#000")
     ax.plot([0.18, 0.82], [1.02, 1.02], color="#000", linewidth=1.4,
@@ -164,9 +166,9 @@ def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
     fig.text(0.690, y, "> -3pp drop", ha="left", va="center", fontsize=10)
 
     gs = fig.add_gridspec(4, 1, top=0.81, bottom=0.02, hspace=0.45)
-    for i, (prefix, short_title) in enumerate(FUNNELS):
+    for i, (prefix, short_title, note) in enumerate(FUNNELS):
         ax = fig.add_subplot(gs[i, 0])
-        render_funnel(ax, prefix, short_title, rows)
+        render_funnel(ax, prefix, short_title, rows, note=note)
 
     plt.savefig(out_path, dpi=170, bbox_inches="tight", facecolor="white")
     plt.close(fig)

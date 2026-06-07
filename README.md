@@ -29,6 +29,8 @@ Common across all funnels:
 
 **Note on SUB:** the rate reflects same-day billing success. Orders that fail same-day enter dunning and may succeed on subsequent days, so the SUB rate here is a leading indicator for anomaly detection — not a final renewal rate.
 
+**`Distinct_Orders` (deduped order count):** the per-funnel `*_Total` columns are *attempt* counts and they **overlap** — a TBYB order's shipping `CAPTURE_SHIPPING` lands in TRY Shipping while a later post-purchase `CAPTURE_FULL` on the *same order* is classified BUY — so summing funnel totals double-counts orders. `Distinct_Orders` is `COUNT(DISTINCT OrderID)` over the successful orders across all funnels (SUB restricted to first-attempt successes) and reconciles to the BI "Analysis Report" / Power BI order count. Use it for order volume; use the funnel `*_Total`/rate columns for payment success monitoring only.
+
 ## Daily routine
 
 Designed for **Claude Code Remote Routine**. Each run:

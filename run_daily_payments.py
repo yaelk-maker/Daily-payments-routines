@@ -23,6 +23,8 @@ Usage:
 Expected JSON shape — a list of period rows. Each row has a ``Period`` key
 ("P4. Yesterday", "P3. Last 7d", "P2. MTD (excl yesterday)", "P1. Previous month")
 and the columns produced by the SQL:
+  Distinct_Orders  (deduped distinct orders with a successful charge across all
+                    funnels — the per-funnel successes overlap and must not be summed)
   TryAuth_Total / TryAuth_Overall / TryAuth_CC / TryAuth_AP / TryAuth_PP
   TryShip_Total / TryShip_Overall / TryShip_CC / TryShip_AP / TryShip_PP
   Buy_Total     / Buy_Overall     / Buy_CC     / Buy_AP     / Buy_PP
@@ -152,6 +154,13 @@ def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
     fig = plt.figure(figsize=(8.5, 9.5))
     fig.text(0.5, 0.985, f"Payment Success Rates - {report_date}",
              ha="center", va="top", fontsize=20, fontweight="bold", color="#000")
+
+    n_orders = rows.get("Yesterday", {}).get("Distinct_Orders")
+    if n_orders is not None:
+        fig.text(0.5, 0.945,
+                 f"Distinct orders with a successful charge yesterday: {int(n_orders):,}"
+                 "   (deduped across funnels — do not sum funnel attempts)",
+                 ha="center", va="top", fontsize=10.5, color="#444")
 
     y = 0.910
     fig.text(0.235, y, "Delta vs Last 7d:", ha="left", va="center", fontsize=10, color="#444")

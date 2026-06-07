@@ -249,11 +249,33 @@ sub_overall AS (
     WHERE order_type='SUB' GROUP BY period, sort_order, OrderID
   )
   GROUP BY period, sort_order
+),
+
+-- Deduped distinct count of orders with a successful charge, across all funnels.
+-- A single order can appear in two funnels (e.g. a TBYB order's shipping CAPTURE
+-- lands in TRY Shipping while a later post-purchase CAPTURE_FULL is classified BUY),
+-- so SUMMING the per-funnel successes double-counts. COUNT(DISTINCT OrderID) over the
+-- union collapses that, and reconciles to the BI Analysis Report order count.
+-- SUB is restricted to first-attempt successes, matching the SUB funnel above.
+distinct_orders AS (
+  SELECT period, sort_order, COUNT(DISTINCT OrderID) AS distinct_success_orders
+  FROM (
+    SELECT period, sort_order, OrderID FROM try_ship_order WHERE attempt=1 AND success=1
+    UNION ALL
+    SELECT period, sort_order, OrderID FROM buy_sub_order  WHERE order_type='BUY' AND attempt=1 AND success=1
+    UNION ALL
+    SELECT b.period, b.sort_order, b.OrderID
+    FROM buy_sub_order b
+    JOIN sub_first_attempt sf ON b.OrderID = sf.RecurringOrderId
+    WHERE b.order_type='SUB' AND b.attempt=1 AND b.success=1
+  )
+  GROUP BY period, sort_order
 )
 
 -- ========== FINAL OUTPUT ==========
 SELECT
   p.period                                               AS Period,
+  dord.distinct_success_orders                           AS Distinct_Orders,
   tao.total_attempts AS TryAuth_Total,  tao.overall_rate AS TryAuth_Overall,
   ta.CC  AS TryAuth_CC,  ta.AP  AS TryAuth_AP,  ta.PP  AS TryAuth_PP,
   tso.total_attempts AS TryShip_Total,  tso.overall_rate AS TryShip_Overall,
@@ -271,4 +293,5 @@ LEFT JOIN buy_pivot         b   USING (period, sort_order)
 LEFT JOIN buy_overall       bo  USING (period, sort_order)
 LEFT JOIN sub_pivot          s   USING (period, sort_order)
 LEFT JOIN sub_overall        so  USING (period, sort_order)
+LEFT JOIN distinct_orders    dord USING (period, sort_order)
 ORDER BY p.sort_order DESC;

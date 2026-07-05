@@ -1,10 +1,18 @@
 -- ============================================================
 -- PAYMENT METHOD SUCCESS RATES BY FUNNEL
 -- ============================================================
--- Output: 4 rows (periods) × 5 columns per funnel (4 funnels)
---         Period | Attempts | Overall% | CC% | Apple Pay% | PayPal%
--- Funnels: TRY Auth | TRY Shipping | BUY | SUB
+-- Output: 4 rows (periods) × 5 columns per funnel
+-- Funnels: TRY Auth | TRY Shipping | BUY (excl. prepaid-converted) | PREPAID CONVERTED | SUB
 -- Payment methods: Credit Card | Apple Pay | PayPal
+--
+-- BUY split (added 2026-07): orders flagged OrdersNew_v.PrepaidConverted are
+-- customers who entered the TRY funnel with a prepaid card and were rerouted
+-- to BUY by the internal mechanism (prepaid not accepted on TRY). This pool
+-- approves at ~19-27% (vs ~95-96% regular BUY) and its volume surges at every
+-- month start, so it is reported separately as an acquisition-quality signal:
+--   BuyReg_*   = BUY excluding prepaid-converted (payments-health signal)
+--   Prepaid_*  = prepaid-converted orders (Total, Rate, Share of BUY)
+--   Buy_Blended_Overall = old blended BUY overall, kept for continuity
 --
 -- Methodology:
 --   TRY Auth/Shipping — aligned with Redash #1610 (TBYB Success Rate Timeline)
@@ -159,11 +167,16 @@ buy_sub_raw AS (
          ELSE                                         'Credit Card' END AS pmt_method,
     CASE WHEN LOWER(pt.EcType) LIKE '%paypal%' THEN true ELSE false END AS is_paypal,
     pt.Sum AS amt,
-    COALESCE(s.Metadata_order_type, o.order_type, 'BUY') AS order_type
+    COALESCE(s.Metadata_order_type, o.order_type, 'BUY') AS order_type,
+    IFNULL(o.prepaid_conv, FALSE) AS prepaid_conv
   FROM `cdc.PaymentTransactions_v` pt
   LEFT JOIN `spreedly.transaction_report_v` s ON pt.OrchestratorToken = s.token
-  LEFT JOIN (SELECT ID AS OrderID, 'SUB' AS order_type FROM `cdc.OrdersNew_v` WHERE SitePart IN (10,12)) o
-    ON o.OrderID = pt.OrderID
+  LEFT JOIN (
+    SELECT ID AS OrderID,
+           CASE WHEN SitePart IN (10,12) THEN 'SUB' END AS order_type,
+           PrepaidConverted AS prepaid_conv
+    FROM `cdc.OrdersNew_v`
+  ) o ON o.OrderID = pt.OrderID
   WHERE pt.TransactionType=0 AND pt.Sum>0
     AND DATE(pt.TransactionTime)
         BETWEEN (SELECT MIN(d_start) FROM periods) AND (SELECT MAX(d_end) FROM periods)
@@ -197,22 +210,47 @@ buy_sub_tagged AS (
 ),
 buy_sub_order AS (
   SELECT period, sort_order, OrderID, pmt_method, order_type,
+    MAX(CASE WHEN prepaid_conv THEN 1 ELSE 0 END) AS prepaid_conv,
     MAX(CASE WHEN pmt_method!='Credit Card' OR (succeeded OR NOT fraud_flag) THEN 1 ELSE 0 END) AS attempt,
     MAX(CASE WHEN succeeded THEN 1 ELSE 0 END) AS success
   FROM buy_sub_tagged
   WHERE capture_type='CAPTURE_FULL'
   GROUP BY period, sort_order, OrderID, pmt_method, order_type
 ),
-buy_pivot AS (
+-- BUY regular = excl. prepaid-converted (payments-health signal)
+buy_reg_pivot AS (
   SELECT period, sort_order,
     ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 2) AS CC,
     ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 2) AS AP,
     ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 2) AS PP
-  FROM buy_sub_order WHERE order_type='BUY' GROUP BY period, sort_order
+  FROM buy_sub_order WHERE order_type='BUY' AND prepaid_conv=0 GROUP BY period, sort_order
 ),
-buy_overall AS (
+buy_reg_overall AS (
   SELECT period, sort_order,
     COUNTIF(attempt=1)                                                                    AS total_attempts,
+    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
+  FROM (
+    SELECT period, sort_order, OrderID,
+      MAX(attempt) AS attempt, MAX(success) AS success
+    FROM buy_sub_order WHERE order_type='BUY' AND prepaid_conv=0 GROUP BY period, sort_order, OrderID
+  )
+  GROUP BY period, sort_order
+),
+-- Prepaid-converted pool (TRY→BUY reroute; acquisition-quality signal)
+prepaid_overall AS (
+  SELECT period, sort_order,
+    COUNTIF(attempt=1)                                                                    AS total_attempts,
+    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
+  FROM (
+    SELECT period, sort_order, OrderID,
+      MAX(attempt) AS attempt, MAX(success) AS success
+    FROM buy_sub_order WHERE order_type='BUY' AND prepaid_conv=1 GROUP BY period, sort_order, OrderID
+  )
+  GROUP BY period, sort_order
+),
+-- Blended BUY overall (old view) kept for series continuity
+buy_blended_overall AS (
+  SELECT period, sort_order,
     ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
   FROM (
     SELECT period, sort_order, OrderID,
@@ -258,8 +296,11 @@ SELECT
   ta.CC  AS TryAuth_CC,  ta.AP  AS TryAuth_AP,  ta.PP  AS TryAuth_PP,
   tso.total_attempts AS TryShip_Total,  tso.overall_rate AS TryShip_Overall,
   ts.CC  AS TryShip_CC,  ts.AP  AS TryShip_AP,  ts.PP  AS TryShip_PP,
-  bo.total_attempts  AS Buy_Total,      bo.overall_rate  AS Buy_Overall,
-  b.CC   AS Buy_CC,       b.AP   AS Buy_AP,       b.PP   AS Buy_PP,
+  bro.total_attempts AS BuyReg_Total,   bro.overall_rate AS BuyReg_Overall,
+  br.CC  AS BuyReg_CC,   br.AP  AS BuyReg_AP,   br.PP  AS BuyReg_PP,
+  po.total_attempts  AS Prepaid_Total,  po.overall_rate  AS Prepaid_Rate,
+  ROUND(SAFE_DIVIDE(po.total_attempts, po.total_attempts + bro.total_attempts)*100, 2) AS Prepaid_Share,
+  bb.overall_rate    AS Buy_Blended_Overall,
   so.total_attempts  AS Sub_Total,      so.overall_rate  AS Sub_Overall,
   s.CC   AS Sub_CC,       s.AP   AS Sub_AP,       s.PP   AS Sub_PP
 FROM periods p
@@ -267,8 +308,10 @@ LEFT JOIN try_auth_pivot   ta  USING (period, sort_order)
 LEFT JOIN try_auth_overall tao USING (period, sort_order)
 LEFT JOIN try_ship_pivot   ts  USING (period, sort_order)
 LEFT JOIN try_ship_overall tso USING (period, sort_order)
-LEFT JOIN buy_pivot         b   USING (period, sort_order)
-LEFT JOIN buy_overall       bo  USING (period, sort_order)
+LEFT JOIN buy_reg_pivot     br  USING (period, sort_order)
+LEFT JOIN buy_reg_overall   bro USING (period, sort_order)
+LEFT JOIN prepaid_overall   po  USING (period, sort_order)
+LEFT JOIN buy_blended_overall bb USING (period, sort_order)
 LEFT JOIN sub_pivot          s   USING (period, sort_order)
 LEFT JOIN sub_overall        so  USING (period, sort_order)
 ORDER BY p.sort_order DESC;

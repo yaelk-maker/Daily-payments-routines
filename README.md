@@ -6,7 +6,7 @@ Daily monitoring of payment success rates across funnels (TRY, BUY, SUB) by paym
 
 | File | Purpose |
 |---|---|
-| `payment method success rates by funnel.sql` | **Routine query.** Returns 4 periods × 4 funnels (TRY Auth, TRY Shipping, BUY, SUB) × 5 columns (`Total`, `Overall`, `CC`, `AP`, `PP`). |
+| `payment method success rates by funnel.sql` | **Routine query.** Returns 4 periods × 4 funnels (TRY Auth, TRY Shipping, BUY excl. prepaid-converted, SUB) × 5 columns (`Total`, `Overall`, `CC`, `AP`, `PP`), plus the prepaid-converted pool (`Prepaid_Total`, `Prepaid_Rate`, `Prepaid_Share`) and `Buy_Blended_Overall` for continuity. |
 | `run_daily_payments.py` | Reads the BQ result JSON, renders the daily PNG, commits + pushes it to the current branch, and posts the Slack `image` block. |
 | `payments.png` | Latest rendered image; referenced by Slack via `raw.githubusercontent.com`. |
 | `try funnel daily monitoring.sql` | **Deep-dive query** (on demand). Detailed TRY-only breakdown: Spreedly vs PayPal, AO-vs-Combined Auth split, Fraud-vs-Payment-Fail Shipping split. |
@@ -19,6 +19,7 @@ Aligned with the canonical Redash queries:
 |---|---|---|
 | TRY Auth, TRY Shipping | Redash #1610 (TBYB Success Rate Timeline) | `QUALIFY MAX(TransactionType)=7` for TRY identification; PP `AUTH_MODIFIED` via window function (failed AO + lower amount); Apple Pay `$0` auth attempts excluded from denominator; **Shipping = `CAPTURE_SHIPPING` only** (no `CAPTURE_FOLLOW_UP`/`FORCE_CAPTURE`); CC fraud-blocked excluded from shipping denominator. |
 | BUY, SUB | Redash #1613 (BUY Success Rate Timeline) | `TransactionType=0` / `CAPTURE_FULL`; `SUB = SitePart IN (10,12)` or Spreedly `Metadata_order_type='SUB'`; CC fraud-blocked excluded. |
+| BUY split | July 2026 root-cause analysis | Orders flagged `OrdersNew_v.PrepaidConverted` (customers who entered TRY with a prepaid card and were rerouted to BUY — prepaid is not accepted on TRY) are **excluded from the BUY tables** and reported separately. The rerouted pool approves at ~19–27% vs ~95–96% for regular BUY, and its volume surges every month start (benefit/paycheck loads), which used to drag the blended BUY rate down ~9–12pp at each month boundary and read as a false payments incident. |
 
 Common across all funnels:
 - Source: `cdc.PaymentTransactions_v` `LEFT JOIN spreedly.transaction_report_v` on `OrchestratorToken`
@@ -54,8 +55,9 @@ Slack `image` blocks require a publicly fetchable HTTPS URL. The Claude Code Rem
 
 A single PNG with:
 - **Page title:** `Payment Success Rates - YYYY-MM-DD`
-- **Legend:** `Delta vs Last 7d:` followed by colored swatches — `stable / up`, `-1 to -3pp`, `> -3pp drop`
-- **One table per funnel** (TRY Auth, TRY Shipping, BUY, SUB) with rows `Yesterday | Last 7d | MTD | Prev month` and columns `Period | Overall | CC | Apple Pay | PayPal | Δ Overall vs 7d`
+- **Legend:** `Delta vs Last 7d:` followed by colored swatches — `stable / up`, `-1 to -3pp`, `> -3pp drop`, plus a note on the prepaid table's inverted thresholds
+- **One table per funnel** (TRY Auth, TRY Shipping, BUY excl. prepaid-converted, SUB) with rows `Yesterday | Last 7d | MTD | Prev month` and columns `Period | Overall | CC | Apple Pay | PayPal | Δ Overall vs 7d`
+- **PREPAID CONVERTED table** (between BUY and SUB) with columns `Period | Orders | Share of BUY | Success rate | Δ Share vs 7d` and a footnote carrying the blended BUY overall (old view)
 - **Yesterday row** uses traffic-light cell backgrounds (per metric vs Last 7d) and a bold colored Δ value
 
 Thresholds (Yesterday vs Last 7d):
@@ -63,6 +65,12 @@ Thresholds (Yesterday vs Last 7d):
 - 🟨 cell: drop 1–3pp
 - 🟩 cell: stable / up
 - Δ text: red when < −0.5pp, green otherwise
+
+Prepaid table (inverted — rising share of BUY is the warning, its success rate is structurally ~19–27%):
+- 🟥 share up > 5pp vs Last 7d
+- 🟨 share up 2–5pp
+- 🟩 share stable / down
+- Δ Share text: red when > +0.5pp, green otherwise
 
 ## Deep-dive (on demand)
 

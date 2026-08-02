@@ -145,6 +145,10 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
         row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG]
         for code, _ in METRICS:
             v = r[f"{prefix}_{code}"]
+            if v is None:
+                row_vals.append("n/a")
+                row_colors.append("white")
+                continue
             row_vals.append(f"{v:.1f}%")
             if is_yest:
                 d = v - rows["Last 7d"][f"{prefix}_{code}"]
@@ -184,6 +188,12 @@ def render_prepaid(ax, rows: dict) -> None:
     for period in PERIODS:
         r = rows[period]
         is_yest = (period == "Yesterday")
+        if r["Prepaid_Total"] is None:
+            row_vals = [period, "n/a", "n/a", "n/a"]
+            row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG, "white", "white", "white"]
+            cell_text.append(row_vals + [""])
+            cell_colors.append(row_colors + ["white"])
+            continue
         row_vals = [period, f"{r['Prepaid_Total']:,}",
                     f"{r['Prepaid_Share']:.1f}%", f"{r['Prepaid_Rate']:.1f}%"]
         row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG, "white",

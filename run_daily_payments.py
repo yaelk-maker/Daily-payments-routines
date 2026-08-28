@@ -246,10 +246,16 @@ def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
     plt.close(fig)
 
 
+PREPAID_KEYS = ("Prepaid_Total", "Prepaid_Rate", "Prepaid_Share")
+
+
 def parse_rows(raw_rows: list) -> dict:
     out = {}
     for r in raw_rows:
         period = PERIOD_FROM_KEY.get(r.get("Period"), r.get("Period"))
+        for key in PREPAID_KEYS:
+            if r.get(key) is None:
+                r[key] = 0
         out[period] = r
     missing = set(PERIODS) - set(out)
     if missing:

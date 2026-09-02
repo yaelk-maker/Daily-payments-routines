@@ -119,6 +119,16 @@ def _style_table(tbl, n_cols: int, yest_delta_tx: str) -> None:
         cell.set_linewidth(1.5)
 
 
+def fmt_pct(v) -> str:
+    """Format a rate, or '–' when the period has no data yet (e.g. MTD on the
+    1st of the month, when 'MTD excl. yesterday' is an empty window)."""
+    return f"{v:.1f}%" if v is not None else "–"
+
+
+def fmt_int(v) -> str:
+    return f"{v:,}" if v is not None else "–"
+
+
 def _title(ax, text: str) -> None:
     ax.axis("off")
     ax.text(0.5, 1.05, text, ha="center", va="bottom",
@@ -129,7 +139,7 @@ def _title(ax, text: str) -> None:
 
 def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = None) -> None:
     yest_total = rows["Yesterday"][f"{prefix}_Total"]
-    title = f"{short_title} - {yest_total:,} attempts yesterday"
+    title = f"{short_title} - {fmt_int(yest_total)} attempts yesterday"
     if note:
         title += f"  ({note})"
     _title(ax, title)
@@ -145,7 +155,7 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
         row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG]
         for code, _ in METRICS:
             v = r[f"{prefix}_{code}"]
-            row_vals.append(f"{v:.1f}%")
+            row_vals.append(fmt_pct(v))
             if is_yest:
                 d = v - rows["Last 7d"][f"{prefix}_{code}"]
                 row_colors.append(bg_for(d))
@@ -176,7 +186,7 @@ def render_prepaid(ax, rows: dict) -> None:
     """Prepaid-converted pool (TRY→BUY reroute). Inverted traffic light: the
     warning signal is a RISING share of BUY, not a falling success rate."""
     _title(ax, f"PREPAID CONVERTED (TRY→BUY reroute) - "
-               f"{rows['Yesterday']['Prepaid_Total']:,} orders yesterday")
+               f"{fmt_int(rows['Yesterday']['Prepaid_Total'])} orders yesterday")
 
     col_labels = ["Period", "Orders", "Share of BUY", "Success rate", "Δ Share vs 7d"]
     share_delta = rows["Yesterday"]["Prepaid_Share"] - rows["Last 7d"]["Prepaid_Share"]
@@ -184,8 +194,8 @@ def render_prepaid(ax, rows: dict) -> None:
     for period in PERIODS:
         r = rows[period]
         is_yest = (period == "Yesterday")
-        row_vals = [period, f"{r['Prepaid_Total']:,}",
-                    f"{r['Prepaid_Share']:.1f}%", f"{r['Prepaid_Rate']:.1f}%"]
+        row_vals = [period, fmt_int(r['Prepaid_Total']),
+                    fmt_pct(r['Prepaid_Share']), fmt_pct(r['Prepaid_Rate'])]
         row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG, "white",
                       bg_for_share(share_delta) if is_yest else "white", "white"]
         if is_yest:

@@ -33,6 +33,11 @@
 -- All funnels:
 --   - Order-level dedup (MAX) per payment method for per-method rates
 --   - Overall rate + total attempts use order-level dedup (each order counted once)
+--
+-- NOTE: the TRY funnel was turned off entirely on 2026-08-23. TRY Auth/Shipping
+-- volume since that date is expected to be near-zero (stragglers checking out
+-- carts created before the cutoff, not a payments incident) — do not treat a
+-- TRY volume collapse after this date as an anomaly.
 -- ============================================================
 
 WITH params AS (

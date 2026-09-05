@@ -30,6 +30,8 @@ Common across all funnels:
 
 **Note on SUB:** the rate reflects same-day billing success. Orders that fail same-day enter dunning and may succeed on subsequent days, so the SUB rate here is a leading indicator for anomaly detection — not a final renewal rate.
 
+**Note on TRY (since Aug 23, 2026):** the TRY funnel was turned off entirely on Aug 23, 2026. TRY Auth/Shipping volume in the daily report since then is expected to be near-zero — it reflects only stragglers completing checkout on carts created before the cutoff, not a payments incident. Do not treat a TRY volume collapse after this date as an anomaly.
+
 ## Daily routine
 
 Designed for **Claude Code Remote Routine**. Each run:

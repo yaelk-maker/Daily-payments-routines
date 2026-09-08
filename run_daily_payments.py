@@ -128,7 +128,7 @@ def _title(ax, text: str) -> None:
 
 
 def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = None) -> None:
-    yest_total = rows["Yesterday"][f"{prefix}_Total"]
+    yest_total = rows["Yesterday"][f"{prefix}_Total"] or 0
     title = f"{short_title} - {yest_total:,} attempts yesterday"
     if note:
         title += f"  ({note})"
@@ -136,7 +136,10 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
 
     col_labels = ["Period"] + [m[1] for m in METRICS] + ["Δ Overall vs 7d"]
     cell_text, cell_colors = [], []
-    overall_delta = rows["Yesterday"][f"{prefix}_Overall"] - rows["Last 7d"][f"{prefix}_Overall"]
+    yest_overall = rows["Yesterday"][f"{prefix}_Overall"]
+    last7_overall = rows["Last 7d"][f"{prefix}_Overall"]
+    overall_delta = (yest_overall - last7_overall
+                      if yest_overall is not None and last7_overall is not None else None)
 
     for period in PERIODS:
         r = rows[period]
@@ -145,16 +148,23 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
         row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG]
         for code, _ in METRICS:
             v = r[f"{prefix}_{code}"]
+            if v is None:
+                row_vals.append("n/a")
+                row_colors.append("white")
+                continue
             row_vals.append(f"{v:.1f}%")
-            if is_yest:
-                d = v - rows["Last 7d"][f"{prefix}_{code}"]
-                row_colors.append(bg_for(d))
+            v7 = rows["Last 7d"][f"{prefix}_{code}"]
+            if is_yest and v7 is not None:
+                row_colors.append(bg_for(v - v7))
             else:
                 row_colors.append("white")
-        if is_yest:
+        if is_yest and overall_delta is not None:
             sign = "+" if overall_delta >= 0 else ""
             row_vals.append(f"{sign}{overall_delta:.1f}pp")
             row_colors.append(bg_for(overall_delta))
+        elif is_yest:
+            row_vals.append("n/a")
+            row_colors.append("white")
         else:
             row_vals.append("")
             row_colors.append("white")
@@ -169,29 +179,39 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
         colWidths=[0.13, 0.13, 0.12, 0.15, 0.13, 0.20],
         bbox=[0.0, 0.0, 1.0, 1.0],
     )
-    _style_table(tbl, len(col_labels), tx_for(overall_delta))
+    _style_table(tbl, len(col_labels), tx_for(overall_delta) if overall_delta is not None else GREEN_TX)
 
 
 def render_prepaid(ax, rows: dict) -> None:
     """Prepaid-converted pool (TRY→BUY reroute). Inverted traffic light: the
     warning signal is a RISING share of BUY, not a falling success rate."""
+    yest_prepaid_total = rows["Yesterday"]["Prepaid_Total"] or 0
     _title(ax, f"PREPAID CONVERTED (TRY→BUY reroute) - "
-               f"{rows['Yesterday']['Prepaid_Total']:,} orders yesterday")
+               f"{yest_prepaid_total:,} orders yesterday")
 
     col_labels = ["Period", "Orders", "Share of BUY", "Success rate", "Δ Share vs 7d"]
-    share_delta = rows["Yesterday"]["Prepaid_Share"] - rows["Last 7d"]["Prepaid_Share"]
+    yest_share = rows["Yesterday"]["Prepaid_Share"]
+    last7_share = rows["Last 7d"]["Prepaid_Share"]
+    share_delta = (yest_share - last7_share
+                   if yest_share is not None and last7_share is not None else None)
     cell_text, cell_colors = [], []
     for period in PERIODS:
         r = rows[period]
         is_yest = (period == "Yesterday")
-        row_vals = [period, f"{r['Prepaid_Total']:,}",
-                    f"{r['Prepaid_Share']:.1f}%", f"{r['Prepaid_Rate']:.1f}%"]
+        row_vals = [period,
+                    f"{r['Prepaid_Total']:,}" if r["Prepaid_Total"] is not None else "0",
+                    f"{r['Prepaid_Share']:.1f}%" if r["Prepaid_Share"] is not None else "n/a",
+                    f"{r['Prepaid_Rate']:.1f}%" if r["Prepaid_Rate"] is not None else "n/a"]
         row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG, "white",
-                      bg_for_share(share_delta) if is_yest else "white", "white"]
-        if is_yest:
+                      bg_for_share(share_delta) if (is_yest and share_delta is not None) else "white",
+                      "white"]
+        if is_yest and share_delta is not None:
             sign = "+" if share_delta >= 0 else ""
             row_vals.append(f"{sign}{share_delta:.1f}pp")
             row_colors.append(bg_for_share(share_delta))
+        elif is_yest:
+            row_vals.append("n/a")
+            row_colors.append("white")
         else:
             row_vals.append("")
             row_colors.append("white")
@@ -206,7 +226,8 @@ def render_prepaid(ax, rows: dict) -> None:
         colWidths=[0.16, 0.15, 0.19, 0.19, 0.21],
         bbox=[0.0, 0.0, 1.0, 1.0],
     )
-    _style_table(tbl, len(col_labels), tx_for(share_delta, invert=True))
+    _style_table(tbl, len(col_labels),
+                 tx_for(share_delta, invert=True) if share_delta is not None else GREEN_TX)
 
     blended_y = rows["Yesterday"]["Buy_Blended_Overall"]
     blended_7 = rows["Last 7d"]["Buy_Blended_Overall"]

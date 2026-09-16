@@ -250,6 +250,10 @@ def parse_rows(raw_rows: list) -> dict:
     out = {}
     for r in raw_rows:
         period = PERIOD_FROM_KEY.get(r.get("Period"), r.get("Period"))
+        # No prepaid-converted orders that period -> BQ LEFT JOIN yields NULL, not 0.
+        for key in ("Prepaid_Total", "Prepaid_Rate", "Prepaid_Share"):
+            if r.get(key) is None:
+                r[key] = 0
         out[period] = r
     missing = set(PERIODS) - set(out)
     if missing:

@@ -250,9 +250,10 @@ def parse_rows(raw_rows: list) -> dict:
     out = {}
     for r in raw_rows:
         period = PERIOD_FROM_KEY.get(r.get("Period"), r.get("Period"))
-        # No prepaid-converted orders that period -> BQ LEFT JOIN yields NULL, not 0.
-        for key in ("Prepaid_Total", "Prepaid_Rate", "Prepaid_Share"):
-            if r.get(key) is None:
+        # Zero attempts for a payment method/funnel that period -> BQ LEFT JOIN /
+        # SAFE_DIVIDE yields NULL, not 0 (e.g. no PayPal TRY attempts that day).
+        for key, val in r.items():
+            if key != "Period" and val is None:
                 r[key] = 0
         out[period] = r
     missing = set(PERIODS) - set(out)

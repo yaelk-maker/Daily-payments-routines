@@ -136,7 +136,8 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
 
     col_labels = ["Period"] + [m[1] for m in METRICS] + ["Δ Overall vs 7d"]
     cell_text, cell_colors = [], []
-    overall_delta = rows["Yesterday"][f"{prefix}_Overall"] - rows["Last 7d"][f"{prefix}_Overall"]
+    yest_overall, last7d_overall = rows["Yesterday"][f"{prefix}_Overall"], rows["Last 7d"][f"{prefix}_Overall"]
+    overall_delta = (yest_overall - last7d_overall) if None not in (yest_overall, last7d_overall) else None
 
     for period in PERIODS:
         r = rows[period]
@@ -144,19 +145,21 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
         row_vals = [period]
         row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG]
         for code, _ in METRICS:
+            # No attempts for this payment method that period -> BQ SAFE_DIVIDE yields NULL.
             v = r[f"{prefix}_{code}"]
-            row_vals.append(f"{v:.1f}%")
+            row_vals.append(f"{v:.1f}%" if v is not None else "N/A")
             if is_yest:
-                d = v - rows["Last 7d"][f"{prefix}_{code}"]
-                row_colors.append(bg_for(d))
+                v7 = rows["Last 7d"][f"{prefix}_{code}"]
+                d = (v - v7) if None not in (v, v7) else None
+                row_colors.append(bg_for(d) if d is not None else "white")
             else:
                 row_colors.append("white")
-        if is_yest:
+        if is_yest and overall_delta is not None:
             sign = "+" if overall_delta >= 0 else ""
             row_vals.append(f"{sign}{overall_delta:.1f}pp")
             row_colors.append(bg_for(overall_delta))
         else:
-            row_vals.append("")
+            row_vals.append("" if not is_yest else "N/A")
             row_colors.append("white")
         cell_text.append(row_vals)
         cell_colors.append(row_colors)
@@ -169,7 +172,7 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
         colWidths=[0.13, 0.13, 0.12, 0.15, 0.13, 0.20],
         bbox=[0.0, 0.0, 1.0, 1.0],
     )
-    _style_table(tbl, len(col_labels), tx_for(overall_delta))
+    _style_table(tbl, len(col_labels), tx_for(overall_delta) if overall_delta is not None else NEUTRAL_TX)
 
 
 def render_prepaid(ax, rows: dict) -> None:

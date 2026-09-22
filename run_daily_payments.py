@@ -145,10 +145,17 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
         row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG]
         for code, _ in METRICS:
             v = r[f"{prefix}_{code}"]
+            if v is None:
+                row_vals.append("N/A")
+                row_colors.append("white")
+                continue
             row_vals.append(f"{v:.1f}%")
             if is_yest:
-                d = v - rows["Last 7d"][f"{prefix}_{code}"]
-                row_colors.append(bg_for(d))
+                v7 = rows["Last 7d"][f"{prefix}_{code}"]
+                if v7 is None:
+                    row_colors.append("white")
+                else:
+                    row_colors.append(bg_for(v - v7))
             else:
                 row_colors.append("white")
         if is_yest:

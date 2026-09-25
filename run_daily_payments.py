@@ -26,6 +26,7 @@ and the columns produced by the SQL:
   BuyPaid_Total   / BuyPaid_Overall   / BuyPaid_CC   / BuyPaid_AP   / BuyPaid_PP
   BuyUnpaid_Total / BuyUnpaid_Overall / BuyUnpaid_CC / BuyUnpaid_AP / BuyUnpaid_PP
   Sub_Total       / Sub_Overall       / Sub_CC       / Sub_AP       / Sub_PP
+  SubAll_Total    / SubAll_Overall    / SubAll_CC    / SubAll_AP    / SubAll_PP
   <funnel>_CC_N / <funnel>_AP_N / <funnel>_PP_N  (per-method order counts)
   BuyPaid_AllOrders   / BuyPaid_BankDecl   / BuyPaid_ForterDecl
   BuyUnpaid_AllOrders / BuyUnpaid_BankDecl / BuyUnpaid_ForterDecl
@@ -69,6 +70,7 @@ FUNNELS = [
     ("BuyUnpaid", "BUY Unpaid", "no paid media"),
     ("DECLINES",  "BUY DECLINES", None),   # rendered by render_declines
     ("Sub",       "SUB",        "first attempt only"),
+    ("SubAll",    "SUB Blended", "all attempts incl. retries"),
 ]
 MIN_SCORED_ORDERS = 50   # yesterday's per-method cells below this are not scored
 
@@ -260,11 +262,11 @@ def _footer_lines(rows: dict) -> list:
 
 
 def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
-    fig = plt.figure(figsize=(8.5, 11.4), facecolor=PAGE_BG)
+    fig = plt.figure(figsize=(8.5, 13.9), facecolor=PAGE_BG)
     fig.text(0.5, 0.988, f"Payment Success Rates - {report_date}",
              ha="center", va="top", fontsize=20, fontweight="bold", color=INK)
 
-    y = 0.935
+    y = 0.948
     fig.text(0.13, y, "Delta vs Last 7d:", ha="left", va="center", fontsize=10, color=NEUTRAL_TX)
     for x, bg, label in [(0.29, GREEN_BG, "stable / up"), (0.43, YELLOW_BG, "-1 to -3pp"),
                          (0.57, RED_BG, "> -3pp drop"),
@@ -272,11 +274,11 @@ def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
         fig.add_artist(mpatches.Rectangle((x, y - 0.008), 0.018, 0.016,
                                           facecolor=bg, edgecolor="none", transform=fig.transFigure))
         fig.text(x + 0.024, y, label, ha="left", va="center", fontsize=10, color=INK)
-    fig.text(0.13, y - 0.020,
+    fig.text(0.13, y - 0.016,
              "Declines table inverted: a rising decline share is the warning (+1pp yellow, +3pp red)",
              ha="left", va="center", fontsize=8.5, style="italic", color=NEUTRAL_TX)
 
-    gs = fig.add_gridspec(len(FUNNELS), 1, top=0.875, bottom=0.07, hspace=0.62)
+    gs = fig.add_gridspec(len(FUNNELS), 1, top=0.895, bottom=0.06, hspace=0.62)
     for i, (prefix, short_title, note) in enumerate(FUNNELS):
         ax = fig.add_subplot(gs[i, 0])
         ax.set_facecolor(PAGE_BG)
@@ -286,7 +288,7 @@ def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
             render_funnel(ax, prefix, short_title, rows, note=note)
 
     for j, line in enumerate(_footer_lines(rows)):
-        fig.text(0.5, 0.030 - j * 0.020, line, ha="center", va="center",
+        fig.text(0.5, 0.024 - j * 0.016, line, ha="center", va="center",
                  fontsize=8.5, style="italic", color=NEUTRAL_TX)
 
     plt.savefig(out_path, dpi=170, bbox_inches="tight", facecolor=PAGE_BG)

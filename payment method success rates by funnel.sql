@@ -1,9 +1,9 @@
 -- ============================================================
 -- PAYMENT METHOD SUCCESS RATES BY FUNNEL
 -- ============================================================
--- Output: 4 rows (periods) × 3 funnels × (Total, Overall, CC, AP, PP + per-method
+-- Output: 4 rows (periods) × 4 funnels × (Total, Overall, CC, AP, PP + per-method
 --         attempt counts *_N, used by the image to skip scoring low-sample cells)
--- Funnels: BUY Paid | BUY Unpaid | SUB
+-- Funnels: BUY Paid | BUY Unpaid | SUB (first attempt) | SUB Blended (all attempts)
 -- Payment methods: Credit Card | Apple Pay | PayPal
 --
 -- 2026-09 redesign: MAËLYS stopped selling through TRY on 23 Aug 2026. The TRY
@@ -13,6 +13,9 @@
 --   BuyPaid_*   = BUY orders whose UTMs classify as paid media
 --   BuyUnpaid_* = BUY orders that did not come from paid media
 --   Sub_*       = subscription recurring charges, first billing attempt only
+--   SubAll_*    = SUB blended: every SUB order processed (first attempt + dunning
+--                 retries). Each retry is its own recurring order ID charged on a
+--                 single day, so each order counts once on its processing date
 --   *_BankDecl / *_ForterDecl / *_AllOrders = BUY decline split (see below)
 --
 -- Paid / Unpaid split — company definition, identical to
@@ -146,7 +149,8 @@ sub_first_attempt AS (
   FROM `subscriptions.SubscriptionsRecurringOrders_v`
   WHERE AttemptsAmount = 1
 ),
--- One funnel label per order-method row; rows outside the three funnels drop out
+-- Funnel label per order-method row; rows outside the funnels drop out.
+-- SUB first-attempt rows appear twice: once as 'Sub', once in 'SubAll'
 funnel_order AS (
   SELECT b.*,
     CASE
@@ -156,6 +160,9 @@ funnel_order AS (
     END AS funnel
   FROM buy_sub_order b
   LEFT JOIN sub_first_attempt f ON b.OrderID = f.RecurringOrderId
+  UNION ALL
+  -- SUB blended: all SUB orders, attempts 1-6 of every cycle
+  SELECT b.*, 'SubAll' AS funnel FROM buy_sub_order b WHERE order_type='SUB'
 ),
 funnel_pivot AS (
   SELECT funnel, period, sort_order,
@@ -186,7 +193,8 @@ funnel_stats AS (
 ),
 bp AS (SELECT * FROM funnel_stats WHERE funnel='BuyPaid'),
 bu AS (SELECT * FROM funnel_stats WHERE funnel='BuyUnpaid'),
-su AS (SELECT * FROM funnel_stats WHERE funnel='Sub')
+su AS (SELECT * FROM funnel_stats WHERE funnel='Sub'),
+sa AS (SELECT * FROM funnel_stats WHERE funnel='SubAll')
 
 -- ========== FINAL OUTPUT ==========
 SELECT
@@ -202,9 +210,13 @@ SELECT
   ROUND(SAFE_DIVIDE(bp.total_attempts, bp.total_attempts + bu.total_attempts)*100, 2) AS BuyPaid_Share,
   su.total_attempts AS Sub_Total,       su.overall_rate AS Sub_Overall,
   su.CC AS Sub_CC,       su.AP AS Sub_AP,       su.PP AS Sub_PP,
-  su.CC_N AS Sub_CC_N,       su.AP_N AS Sub_AP_N,       su.PP_N AS Sub_PP_N
+  su.CC_N AS Sub_CC_N,       su.AP_N AS Sub_AP_N,       su.PP_N AS Sub_PP_N,
+  sa.total_attempts AS SubAll_Total,    sa.overall_rate AS SubAll_Overall,
+  sa.CC AS SubAll_CC,    sa.AP AS SubAll_AP,    sa.PP AS SubAll_PP,
+  sa.CC_N AS SubAll_CC_N,    sa.AP_N AS SubAll_AP_N,    sa.PP_N AS SubAll_PP_N
 FROM periods p
 LEFT JOIN bp USING (period, sort_order)
 LEFT JOIN bu USING (period, sort_order)
 LEFT JOIN su USING (period, sort_order)
+LEFT JOIN sa USING (period, sort_order)
 ORDER BY p.sort_order DESC;

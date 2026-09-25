@@ -1,12 +1,12 @@
 # Daily-payments-routines
 
-Daily monitoring of payment success rates for the three live funnels (BUY Paid, BUY Unpaid, SUB) by payment method, posted as a single PNG to `#payments-daily-monitoring`.
+Daily monitoring of payment success rates for the live funnels (BUY Paid, BUY Unpaid, SUB first attempt, SUB blended) by payment method, posted as a single PNG to `#payments-daily-monitoring`.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `payment method success rates by funnel.sql` | **Routine query.** Returns 4 periods × 3 funnels (`BuyPaid`, `BuyUnpaid`, `Sub`) × (`Total`, `Overall`, `CC`, `AP`, `PP`, plus per-method order counts `CC_N`/`AP_N`/`PP_N`), the BUY decline split (`AllOrders`, `BankDecl`, `ForterDecl`) and `BuyPaid_Share`. |
+| `payment method success rates by funnel.sql` | **Routine query.** Returns 4 periods × 4 funnels (`BuyPaid`, `BuyUnpaid`, `Sub`, `SubAll`) × (`Total`, `Overall`, `CC`, `AP`, `PP`, plus per-method order counts `CC_N`/`AP_N`/`PP_N`), the BUY decline split (`AllOrders`, `BankDecl`, `ForterDecl`) and `BuyPaid_Share`. |
 | `run_daily_payments.py` | Reads the BQ result JSON, renders the daily PNG, commits + pushes it to the current branch, and posts the Slack `image` block. |
 | `payments.png` | Latest rendered image; referenced by Slack via `raw.githubusercontent.com`. |
 | `archive/try funnel daily monitoring.sql` | Retired TRY deep-dive (AO vs AM auth, fraud vs payment-fail shipping). Kept for reference only; TRY stopped selling on 23 Aug 2026. |
@@ -20,6 +20,7 @@ MAËLYS stopped selling through TRY on 23 Aug 2026. After that date TRY fell fro
 | **BUY Paid** | BUY orders whose UTMs classify as paid media |
 | **BUY Unpaid** | BUY orders that did not come from paid media (organic / direct, CRM, unpaid search, other) |
 | **SUB** | Subscription recurring charges, first billing attempt only (unchanged) |
+| **SUB Blended** | Every SUB order processed: first attempts plus dunning retries (attempts 2 to 6 of each cycle) |
 | **BUY DECLINES** | Declined BUY orders split into bank / PSP declines and Forter fraud blocks, for Paid and Unpaid |
 
 ## Methodology
@@ -43,6 +44,7 @@ The functions are applied to the order's own UTMs in `cdc.OrdersNew_v`, not to `
 - TRY orders are excluded from BUY and SUB: any order in `cdc.TbybOrders_v`, or with a TRY auth (`TransactionType=7`) in the window. Without this, TRY shipping and post-trial charges that have no Spreedly metadata (PayPal) fell through the `'BUY'` fallback. The TRY checkouts still coming in are customers completing old carts saved in their browser; they are immaterial and not reported.
 - `OrdersNew_v.PrepaidConverted` orders are still excluded from BUY (the flow ended with TRY; ~20% approval would add noise)
 - SUB is restricted to the first billing attempt (`subscriptions.SubscriptionsRecurringOrders_v.AttemptsAmount = 1`)
+- SUB Blended takes every SUB order. Each retry is its own recurring order ID charged on a single day, so each order counts once on its processing date. The blended rate sits far below the first-attempt rate: on 24 Sep, 1,029 first attempts approved at 58.9% and 2,208 retries at ~3.9%, so 3,237 orders were approved at 21.4%. It moves with the retry mix as well as with payments health.
 
 Common across all funnels:
 - Source: `cdc.PaymentTransactions_v` `LEFT JOIN spreedly.transaction_report_v` on `OrchestratorToken`
@@ -68,7 +70,7 @@ Runs as the Claude Code Remote Routine **"Payments success rate monitoring"** (d
 
 1. Execute `payment method success rates by funnel.sql` via the BigQuery MCP (project `maelys-data`) and capture the 4 rows as JSON, for example saved to `/tmp/bq_results.json`.
 2. Run `python run_daily_payments.py /tmp/bq_results.json` (or `... -` for stdin). The script:
-   - Renders `payments.png` (page title, color legend, BUY Paid / BUY Unpaid / BUY DECLINES / SUB tables with traffic-light highlighting on the Yesterday row, and a footer line).
+   - Renders `payments.png` (page title, color legend, BUY Paid / BUY Unpaid / BUY DECLINES / SUB / SUB Blended tables with traffic-light highlighting on the Yesterday row, and a footer line).
    - Commits and pushes `payments.png` to the current branch.
    - Posts a Slack `image` block to `#payments-daily-monitoring` referencing `https://raw.githubusercontent.com/yaelk-maker/Daily-payments-routines/<branch>/payments.png?v=<ts>`.
 
@@ -88,7 +90,7 @@ Slack `image` blocks require a publicly fetchable HTTPS URL. The Claude Code Rem
 A single PNG with:
 - **Page title:** `Payment Success Rates - YYYY-MM-DD`
 - **Legend:** `Delta vs Last 7d:` followed by colored swatches: `stable / up`, `-1 to -3pp`, `> -3pp drop`, `< 50 orders`
-- **One table per funnel** (BUY Paid, BUY Unpaid, SUB) with rows `Yesterday | Last 7d | MTD | Prev month` and columns `Period | Overall | CC | Apple Pay | PayPal | Δ Overall vs 7d`
+- **One table per funnel** (BUY Paid, BUY Unpaid, SUB, SUB Blended at the bottom) with rows `Yesterday | Last 7d | MTD | Prev month` and columns `Period | Overall | CC | Apple Pay | PayPal | Δ Overall vs 7d`
 - **BUY DECLINES table** (between BUY Unpaid and SUB) with columns `Period | Paid: Bank | Paid: Forter | Unpaid: Bank | Unpaid: Forter`; each cell shows `orders (share of all BUY orders)`
 - **Footer:** paid media share of BUY orders (yesterday vs last 7d)
 

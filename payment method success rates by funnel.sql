@@ -16,7 +16,10 @@
 --   SubAll_*    = SUB blended: every SUB order processed (first attempt + dunning
 --                 retries). Each retry is its own recurring order ID charged on a
 --                 single day, so each order counts once on its processing date
---   *_BankDecl / *_ForterDecl / *_AllOrders = BUY decline split (see below)
+--   BUY only, per column <m> in (Overall, CC, AP, PP):
+--     <m>_Fraud     = Forter fraud declines, % of ALL orders (incl. Forter-blocked)
+--     <m>_TotalSucc = overall success, % of ALL orders (incl. Forter-blocked)
+--     <m>_AllN / AllOrders = order counts behind those two rates
 --
 -- Paid / Unpaid split — company definition, identical to
 -- aas_equivalent.FS_STATIC.MediaPaidType / Orders_s.MediaPaidType / Live Report v2:
@@ -38,15 +41,18 @@
 --     immaterial and not reported.
 --   - PrepaidConverted orders (TRY->BUY reroute, ~20% approval) excluded from
 --     BUY; the flow ended with TRY and is no longer reported
---   - CC fraud-blocked excluded from denominator of the success rates
---   - Decline split (BUY only; SUB is merchant-initiated, no Forter screening):
---       ForterDecl = order never succeeded and at least one attempt was blocked by
---                    Forter pre-auth (Spreedly Message LIKE '%fraud%': "gateway
---                    transaction not attempted due to failed pre authorization
---                    fraud check.")
---       BankDecl   = order never succeeded, no Forter block (issuer / PSP decline)
---       AllOrders  = every order in the funnel incl. Forter-blocked (the base for
---                    decline shares; so BankDecl share is not exactly 100 - Overall)
+--   - Forter-declined orders excluded from the denominator of the card success
+--     rates (Overall / CC / AP / PP). NOTE (2026-09): previously only orders whose
+--     every attempt was Forter-blocked were excluded; now any order that never
+--     succeeded and had a Forter block is excluded, so the three BUY Yesterday
+--     rows reconcile: TotalSucc = card success x (1 - Fraud). Moves rates ~0.05pp.
+--   - Forter split (BUY only; SUB is merchant-initiated, no Forter screening):
+--       Fraud decline = order never succeeded and at least one attempt was blocked
+--                       by Forter pre-auth (Spreedly Message LIKE '%fraud%':
+--                       "gateway transaction not attempted due to failed pre
+--                       authorization fraud check.")
+--       Card success  (<m>)           = success / orders excl. Forter-declined
+--       Overall success (<m>_TotalSucc) = success / all orders incl. Forter blocks
 --   - SUB restricted to first billing attempt per cycle (AttemptsAmount=1)
 --   - NOTE: SUB rate = same-day billing success; remaining orders enter dunning
 --     and may succeed on subsequent days. Use for anomaly detection, not final rates.
@@ -135,9 +141,11 @@ buy_sub_order AS (
   SELECT period, sort_order, OrderID, pmt_method, order_type,
     MAX(CASE WHEN prepaid_conv THEN 1 ELSE 0 END) AS prepaid_conv,
     ANY_VALUE(media) AS media,
-    MAX(CASE WHEN pmt_method!='Credit Card' OR (succeeded OR NOT fraud_flag) THEN 1 ELSE 0 END) AS attempt,
     MAX(CASE WHEN succeeded THEN 1 ELSE 0 END) AS success,
-    MAX(CASE WHEN fraud_flag THEN 1 ELSE 0 END) AS forter_block
+    MAX(CASE WHEN fraud_flag THEN 1 ELSE 0 END) AS forter_block,
+    -- scored for card success unless the order was declined by Forter
+    CASE WHEN MAX(CASE WHEN succeeded THEN 1 ELSE 0 END)=1
+           OR MAX(CASE WHEN fraud_flag THEN 1 ELSE 0 END)=0 THEN 1 ELSE 0 END AS attempt
   FROM buy_sub_tagged
   WHERE capture_type='CAPTURE_FULL'
   GROUP BY period, sort_order, OrderID, pmt_method, order_type
@@ -171,19 +179,30 @@ funnel_pivot AS (
     ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 2) AS PP,
     COUNTIF(pmt_method='Credit Card' AND attempt=1) AS CC_N,
     COUNTIF(pmt_method='Apple Pay'   AND attempt=1) AS AP_N,
-    COUNTIF(pmt_method='PayPal'      AND attempt=1) AS PP_N
+    COUNTIF(pmt_method='PayPal'      AND attempt=1) AS PP_N,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=0 AND forter_block=1), COUNTIF(pmt_method='Credit Card'))*100, 2) AS CC_Fraud,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=0 AND forter_block=1), COUNTIF(pmt_method='Apple Pay'))*100, 2)   AS AP_Fraud,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=0 AND forter_block=1), COUNTIF(pmt_method='PayPal'))*100, 2)      AS PP_Fraud,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card'))*100, 2) AS CC_TotalSucc,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'))*100, 2)   AS AP_TotalSucc,
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'))*100, 2)      AS PP_TotalSucc,
+    COUNTIF(pmt_method='Credit Card') AS CC_AllN,
+    COUNTIF(pmt_method='Apple Pay')   AS AP_AllN,
+    COUNTIF(pmt_method='PayPal')      AS PP_AllN
   FROM funnel_order WHERE funnel IS NOT NULL GROUP BY funnel, period, sort_order
 ),
 funnel_overall AS (
   SELECT funnel, period, sort_order,
     COUNTIF(attempt=1)                                                                    AS total_attempts,
     ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate,
-    COUNT(*)                                     AS all_orders,
-    COUNTIF(success=0 AND forter_block=0)        AS bank_declined,
-    COUNTIF(success=0 AND forter_block=1)        AS forter_declined
+    COUNT(*)                                                                    AS all_orders,
+    ROUND(SAFE_DIVIDE(COUNTIF(success=0 AND forter_block=1), COUNT(*))*100, 2) AS overall_fraud,
+    ROUND(SAFE_DIVIDE(COUNTIF(success=1), COUNT(*))*100, 2)                    AS overall_total_succ
   FROM (
+    -- order level: Forter-declined = never succeeded and at least one Forter block
     SELECT funnel, period, sort_order, OrderID,
-      MAX(attempt) AS attempt, MAX(success) AS success, MAX(forter_block) AS forter_block
+      MAX(success) AS success, MAX(forter_block) AS forter_block,
+      CASE WHEN MAX(success)=1 OR MAX(forter_block)=0 THEN 1 ELSE 0 END AS attempt
     FROM funnel_order WHERE funnel IS NOT NULL GROUP BY funnel, period, sort_order, OrderID
   )
   GROUP BY funnel, period, sort_order
@@ -202,11 +221,17 @@ SELECT
   bp.total_attempts AS BuyPaid_Total,   bp.overall_rate AS BuyPaid_Overall,
   bp.CC AS BuyPaid_CC,   bp.AP AS BuyPaid_AP,   bp.PP AS BuyPaid_PP,
   bp.CC_N AS BuyPaid_CC_N,   bp.AP_N AS BuyPaid_AP_N,   bp.PP_N AS BuyPaid_PP_N,
-  bp.all_orders AS BuyPaid_AllOrders, bp.bank_declined AS BuyPaid_BankDecl, bp.forter_declined AS BuyPaid_ForterDecl,
+  bp.all_orders AS BuyPaid_AllOrders, bp.overall_fraud AS BuyPaid_Overall_Fraud, bp.overall_total_succ AS BuyPaid_Overall_TotalSucc,
+  bp.CC_Fraud AS BuyPaid_CC_Fraud, bp.AP_Fraud AS BuyPaid_AP_Fraud, bp.PP_Fraud AS BuyPaid_PP_Fraud,
+  bp.CC_TotalSucc AS BuyPaid_CC_TotalSucc, bp.AP_TotalSucc AS BuyPaid_AP_TotalSucc, bp.PP_TotalSucc AS BuyPaid_PP_TotalSucc,
+  bp.CC_AllN AS BuyPaid_CC_AllN, bp.AP_AllN AS BuyPaid_AP_AllN, bp.PP_AllN AS BuyPaid_PP_AllN,
   bu.total_attempts AS BuyUnpaid_Total, bu.overall_rate AS BuyUnpaid_Overall,
   bu.CC AS BuyUnpaid_CC, bu.AP AS BuyUnpaid_AP, bu.PP AS BuyUnpaid_PP,
   bu.CC_N AS BuyUnpaid_CC_N, bu.AP_N AS BuyUnpaid_AP_N, bu.PP_N AS BuyUnpaid_PP_N,
-  bu.all_orders AS BuyUnpaid_AllOrders, bu.bank_declined AS BuyUnpaid_BankDecl, bu.forter_declined AS BuyUnpaid_ForterDecl,
+  bu.all_orders AS BuyUnpaid_AllOrders, bu.overall_fraud AS BuyUnpaid_Overall_Fraud, bu.overall_total_succ AS BuyUnpaid_Overall_TotalSucc,
+  bu.CC_Fraud AS BuyUnpaid_CC_Fraud, bu.AP_Fraud AS BuyUnpaid_AP_Fraud, bu.PP_Fraud AS BuyUnpaid_PP_Fraud,
+  bu.CC_TotalSucc AS BuyUnpaid_CC_TotalSucc, bu.AP_TotalSucc AS BuyUnpaid_AP_TotalSucc, bu.PP_TotalSucc AS BuyUnpaid_PP_TotalSucc,
+  bu.CC_AllN AS BuyUnpaid_CC_AllN, bu.AP_AllN AS BuyUnpaid_AP_AllN, bu.PP_AllN AS BuyUnpaid_PP_AllN,
   ROUND(SAFE_DIVIDE(bp.total_attempts, bp.total_attempts + bu.total_attempts)*100, 2) AS BuyPaid_Share,
   su.total_attempts AS Sub_Total,       su.overall_rate AS Sub_Overall,
   su.CC AS Sub_CC,       su.AP AS Sub_AP,       su.PP AS Sub_PP,

@@ -6,7 +6,7 @@ Daily monitoring of payment success rates for the live funnels (BUY Paid, BUY Un
 
 | File | Purpose |
 |---|---|
-| `payment method success rates by funnel.sql` | **Routine query.** Returns 4 periods × 4 funnels (`BuyPaid`, `BuyUnpaid`, `Sub`, `SubAll`) × (`Total`, `Overall`, `CC`, `AP`, `PP`, plus per-method order counts `CC_N`/`AP_N`/`PP_N`), the BUY decline split (`AllOrders`, `BankDecl`, `ForterDecl`) and `BuyPaid_Share`. |
+| `payment method success rates by funnel.sql` | **Routine query.** Returns 4 periods × 4 funnels (`BuyPaid`, `BuyUnpaid`, `Sub`, `SubAll`) × (`Total`, `Overall`, `CC`, `AP`, `PP`, plus per-method order counts `CC_N`/`AP_N`/`PP_N`), for BUY the Forter split per column (`<m>_Fraud`, `<m>_TotalSucc`, `<m>_AllN`, `AllOrders`) and `BuyPaid_Share`. |
 | `run_daily_payments.py` | Reads the BQ result JSON, renders the daily PNG, commits + pushes it to the current branch, and posts the Slack `image` block. |
 | `payments.png` | Latest rendered image; referenced by Slack via `raw.githubusercontent.com`. |
 | `archive/try funnel daily monitoring.sql` | Retired TRY deep-dive (AO vs AM auth, fraud vs payment-fail shipping). Kept for reference only; TRY stopped selling on 23 Aug 2026. |
@@ -21,7 +21,6 @@ MAËLYS stopped selling through TRY on 23 Aug 2026. After that date TRY fell fro
 | **BUY Unpaid** | BUY orders that did not come from paid media (organic / direct, CRM, unpaid search, other) |
 | **SUB** | Subscription recurring charges, first billing attempt only (unchanged) |
 | **SUB Blended** | Every SUB order processed: first attempts plus dunning retries (attempts 2 to 6 of each cycle) |
-| **BUY DECLINES** | Declined BUY orders split into bank / PSP declines and Forter fraud blocks, for Paid and Unpaid |
 
 ## Methodology
 
@@ -53,14 +52,17 @@ Common across all funnels:
 - Order-level dedup (`MAX` over flags); `Overall` and `Total` columns dedup orders once across payment methods
 - Rates rounded to 2 decimal places; the image renders them at 1dp
 
-**BUY decline split** (order level, BUY only):
+**BUY Yesterday rows** (order level, BUY only). Each BUY table shows three Yesterday rows:
 
-| Bucket | Rule |
+| Row | Definition |
 |---|---|
-| Forter | The order never succeeded and at least one attempt was blocked by Forter's pre-auth fraud check (Spreedly `Message` contains `fraud`: "gateway transaction not attempted due to failed pre authorization fraud check.") |
-| Bank | The order never succeeded and no attempt was Forter-blocked (issuer / PSP decline, any payment method) |
+| Yest. card success | Approved / orders that were **not** Forter-declined. This is the metric in the Last 7d / MTD / Prev month rows. |
+| Yest. fraud declines | Forter-declined orders / **all** orders. Forter-declined = the order never succeeded and at least one attempt was blocked by Forter's pre-auth fraud check (Spreedly `Message` contains `fraud`: "gateway transaction not attempted due to failed pre authorization fraud check.") |
+| Yest. overall success | Approved / **all** orders, including Forter-declined |
 
-Shares are of **all** BUY orders in the segment, including Forter-blocked ones, so `Bank %` is not exactly `100 − Overall`. An order that was both bank-declined and Forter-blocked on different attempts counts as Forter. Forter blocks are almost all credit card (1 Apple Pay, 0 PayPal from 26 Aug to 24 Sep). SUB is merchant-initiated and not Forter-screened, so all SUB declines are bank declines (`100 − Overall`).
+The three reconcile: overall success = card success × (1 − fraud declines). Forter blocks are almost all credit card: from 26 Aug to 24 Sep there was 1 Apple Pay block and 0 PayPal, so Apple Pay and PayPal normally show 0.0% fraud declines. SUB is merchant-initiated and not Forter-screened.
+
+Change in Sep 2026: card success used to drop an order from the denominator only when **every** attempt on it was Forter-blocked. It now drops every Forter-declined order, so the three rows reconcile. On 24 Sep data this moved the historical BUY rates by +0.03 to +0.10pp (e.g. BUY Paid last 7d 96.37% → 96.43%).
 
 **Note on SUB:** the rate reflects same-day billing success. Orders that fail same-day enter dunning and may succeed on subsequent days, so the SUB rate here is a leading indicator for anomaly detection, not a final renewal rate.
 
@@ -70,7 +72,7 @@ Runs as the Claude Code Remote Routine **"Payments success rate monitoring"** (d
 
 1. Execute `payment method success rates by funnel.sql` via the BigQuery MCP (project `maelys-data`) and capture the 4 rows as JSON, for example saved to `/tmp/bq_results.json`.
 2. Run `python run_daily_payments.py /tmp/bq_results.json` (or `... -` for stdin). The script:
-   - Renders `payments.png` (page title, color legend, BUY Paid / BUY Unpaid / BUY DECLINES / SUB / SUB Blended tables with traffic-light highlighting on the Yesterday row, and a footer line).
+   - Renders `payments.png` (page title, color legend, BUY Paid / BUY Unpaid / SUB / SUB Blended tables with traffic-light highlighting on the Yesterday row, and a footer line).
    - Commits and pushes `payments.png` to the current branch.
    - Posts a Slack `image` block to `#payments-daily-monitoring` referencing `https://raw.githubusercontent.com/yaelk-maker/Daily-payments-routines/<branch>/payments.png?v=<ts>`.
 
@@ -91,7 +93,7 @@ A single PNG with:
 - **Page title:** `Payment Success Rates - YYYY-MM-DD`
 - **Legend:** `Delta vs Last 7d:` followed by colored swatches: `stable / up`, `-1 to -3pp`, `> -3pp drop`, `< 50 orders`
 - **One table per funnel** (BUY Paid, BUY Unpaid, SUB, SUB Blended at the bottom) with rows `Yesterday | Last 7d | MTD | Prev month` and columns `Period | Overall | CC | Apple Pay | PayPal | Δ Overall vs 7d`
-- **BUY DECLINES table** (between BUY Unpaid and SUB) with columns `Period | Paid: Bank | Paid: Forter | Unpaid: Bank | Unpaid: Forter`; each cell shows `orders (share of all BUY orders)`
+- **BUY tables** have three Yesterday rows (`Yest. card success`, `Yest. fraud declines`, `Yest. overall success`) above `Last 7d | MTD | Prev month`
 - **Footer:** paid media share of BUY orders (yesterday vs last 7d)
 
 Thresholds (Yesterday vs Last 7d):
@@ -101,8 +103,4 @@ Thresholds (Yesterday vs Last 7d):
 - ⬜ grey cell: fewer than 50 orders yesterday for that payment method, not scored (one decline in 50 is 2pp; splitting BUY in two leaves PayPal and Apple Pay at ~35 to 60 orders a day)
 - Δ text: red when < −0.5pp, green otherwise
 
-BUY DECLINES table (inverted: a rising decline share is the warning):
-- 🟥 share up > 3pp vs Last 7d
-- 🟨 share up 1 to 3pp
-- 🟩 share stable / down
-- ⬜ fewer than 50 orders in the segment yesterday, not scored
+BUY tables: only the `Yest. overall success` row is coloured, and its Δ compares overall success yesterday with overall success over the last 7 days (like-for-like, Forter-declined orders included in both). The card success and fraud decline rows are plain numbers.

@@ -28,17 +28,20 @@ and the columns produced by the SQL:
   Sub_Total       / Sub_Overall       / Sub_CC       / Sub_AP       / Sub_PP
   SubAll_Total    / SubAll_Overall    / SubAll_CC    / SubAll_AP    / SubAll_PP
   <funnel>_CC_N / <funnel>_AP_N / <funnel>_PP_N  (per-method order counts)
-  BuyPaid_AllOrders   / BuyPaid_BankDecl   / BuyPaid_ForterDecl
-  BuyUnpaid_AllOrders / BuyUnpaid_BankDecl / BuyUnpaid_ForterDecl
+  BUY only: <funnel>_<m>_Fraud / <funnel>_<m>_TotalSucc / <funnel>_<m>_AllN for
+  <m> in (Overall, CC, AP, PP), with <funnel>_AllOrders as the Overall count
   BuyPaid_Share
 
 TRY was retired on 23 Aug 2026. BUY is split by acquisition source using the
 company MediaPaidType definition (paid media vs everything else). Yesterday's
 per-method cells are only traffic-lighted when they carry at least
 MIN_SCORED_ORDERS orders; smaller cells are greyed out so a single decline
-does not read as an incident. The BUY DECLINES table splits declined orders
-into bank / PSP declines and Forter fraud blocks, with an INVERTED traffic
-light (a rising decline share is the warning).
+does not read as an incident.
+
+BUY tables show three Yesterday rows: card success (Forter-declined orders
+excluded), Forter fraud declines, and overall success (all orders). Only the
+overall success row is traffic-lighted, against overall success over the last
+7 days. Last 7d / MTD / Prev month show card success.
 """
 
 import json
@@ -65,10 +68,10 @@ PERIOD_FROM_KEY = {
     "P1. Previous month":       "Prev month",
 }
 METRICS = [("Overall", "Overall"), ("CC", "CC"), ("AP", "Apple Pay"), ("PP", "PayPal")]
+BUY_FUNNELS = {"BuyPaid", "BuyUnpaid"}
 FUNNELS = [
     ("BuyPaid",   "BUY Paid",   "paid media"),
     ("BuyUnpaid", "BUY Unpaid", "no paid media"),
-    ("DECLINES",  "BUY DECLINES", None),   # rendered by render_declines
     ("Sub",       "SUB",        "first attempt only"),
     ("SubAll",    "SUB Blended", "all attempts incl. retries"),
 ]
@@ -81,6 +84,7 @@ HEADER_BG      = "#FFAFC4"
 PERIOD_BG      = "#FFE0E9"
 YEST_PERIOD_BG = "#DB6B8A"
 YEST_PERIOD_TX = "#FBFAF8"
+YEST_SUB_BG    = "#FFE0E9"   # the two extra BUY Yesterday rows
 NEUTRAL_TX     = "#5A524D"
 LOW_N_BG       = "#EBE5E2"
 GREEN_BG, YELLOW_BG, RED_BG = "#A8E0A0", "#FFE99C", "#F5C6CB"
@@ -95,26 +99,22 @@ def bg_for(delta: float) -> str:
     return GREEN_BG
 
 
-def bg_for_decline(delta: float) -> str:
-    """Inverted thresholds for decline shares: a RISING share is the warning."""
-    return bg_for(-delta)
-
-
 def tx_for(delta: float) -> str:
     return RED_TX if delta < -0.5 else GREEN_TX
 
 
-def _style_table(tbl, n_cols: int, yest_delta_tx: str) -> None:
+def _style_table(tbl, n_cols: int, yest_delta_tx: str, yest_rows: int = 1) -> None:
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(10)
     for i in range(n_cols):
         h = tbl[(0, i)]
         h.get_text().set_color(INK)
         h.get_text().set_fontweight("bold")
-    yc = tbl[(1, 0)]
-    yc.get_text().set_color(YEST_PERIOD_TX)
-    yc.get_text().set_fontweight("bold")
-    dc = tbl[(1, n_cols - 1)]
+    for i in range(1, yest_rows + 1):
+        yc = tbl[(i, 0)]
+        yc.get_text().set_color(YEST_PERIOD_TX if i == yest_rows else INK)
+        yc.get_text().set_fontweight("bold")
+    dc = tbl[(yest_rows, n_cols - 1)]
     dc.get_text().set_color(yest_delta_tx)
     dc.get_text().set_fontweight("bold")
     for cell in tbl.get_celld().values():
@@ -134,8 +134,24 @@ def _pct(v) -> str:
     return "n/a" if v is None else f"{v:.1f}%"
 
 
+def _score(v, base, n) -> str:
+    """Traffic-light background for a Yesterday cell, grey when not scorable."""
+    if v is None or base is None or (n or 0) < MIN_SCORED_ORDERS:
+        return LOW_N_BG
+    return bg_for(v - base)
+
+
+def _delta_cell(v, base):
+    if v is None or base is None:
+        return "", "white", 0.0
+    d = v - base
+    return f"{'+' if d >= 0 else ''}{d:.1f}pp", bg_for(d), d
+
+
 def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = None) -> None:
-    yest_total = rows["Yesterday"][f"{prefix}_Total"] or 0
+    is_buy = prefix in BUY_FUNNELS
+    y, l7 = rows["Yesterday"], rows["Last 7d"]
+    yest_total = (y.get(f"{prefix}_AllOrders") if is_buy else y[f"{prefix}_Total"]) or 0
     title = f"{short_title} - {yest_total:,} orders yesterday"
     if note:
         title += f"  ({note})"
@@ -143,112 +159,57 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
 
     col_labels = ["Period"] + [m[1] for m in METRICS] + ["Δ Overall vs 7d"]
     cell_text, cell_colors = [], []
-    y_overall = rows["Yesterday"][f"{prefix}_Overall"]
-    l7_overall = rows["Last 7d"][f"{prefix}_Overall"]
-    overall_delta = (None if y_overall is None or l7_overall is None
-                     else y_overall - l7_overall)
 
-    for period in PERIODS:
-        r = rows[period]
-        is_yest = (period == "Yesterday")
-        row_vals = [period]
-        row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG]
+    def n_for(r, code, all_orders):
+        if code == "Overall":
+            return r.get(f"{prefix}_AllOrders") if all_orders else r[f"{prefix}_Total"]
+        return r.get(f"{prefix}_{code}_AllN" if all_orders else f"{prefix}_{code}_N")
+
+    if is_buy:
+        # Row 1: card success, row 2: Forter fraud declines (plain numbers)
+        for label, suffix in (("Yest. card success", ""), ("Yest. fraud declines", "_Fraud")):
+            cell_text.append([label] + [_pct(y.get(f"{prefix}_{c}{suffix}")) for c, _ in METRICS] + [""])
+            cell_colors.append([YEST_SUB_BG] + ["white"] * (len(METRICS) + 1))
+        # Row 3: overall success incl. Forter-blocked, scored vs the same metric last 7d
+        vals, colors = ["Yest. overall success"], [YEST_PERIOD_BG]
         for code, _ in METRICS:
-            v = r[f"{prefix}_{code}"]
-            row_vals.append(_pct(v))
-            if not is_yest:
-                row_colors.append("white")
-                continue
-            base = rows["Last 7d"][f"{prefix}_{code}"]
-            n = r[f"{prefix}_Total"] if code == "Overall" else r.get(f"{prefix}_{code}_N")
-            if v is None or base is None or (n or 0) < MIN_SCORED_ORDERS:
-                row_colors.append(LOW_N_BG)
-            else:
-                row_colors.append(bg_for(v - base))
-        if is_yest and overall_delta is not None:
-            sign = "+" if overall_delta >= 0 else ""
-            row_vals.append(f"{sign}{overall_delta:.1f}pp")
-            row_colors.append(bg_for(overall_delta))
-        else:
-            row_vals.append("")
-            row_colors.append("white")
-        cell_text.append(row_vals)
-        cell_colors.append(row_colors)
+            v, base = y.get(f"{prefix}_{code}_TotalSucc"), l7.get(f"{prefix}_{code}_TotalSucc")
+            vals.append(_pct(v))
+            colors.append(_score(v, base, n_for(y, code, True)))
+        d_txt, d_bg, delta = _delta_cell(y.get(f"{prefix}_Overall_TotalSucc"),
+                                         l7.get(f"{prefix}_Overall_TotalSucc"))
+        cell_text.append(vals + [d_txt])
+        cell_colors.append(colors + [d_bg])
+        yest_rows = 3
+    else:
+        vals, colors = ["Yesterday"], [YEST_PERIOD_BG]
+        for code, _ in METRICS:
+            v, base = y[f"{prefix}_{code}"], l7[f"{prefix}_{code}"]
+            vals.append(_pct(v))
+            colors.append(_score(v, base, n_for(y, code, False)))
+        d_txt, d_bg, delta = _delta_cell(y[f"{prefix}_Overall"], l7[f"{prefix}_Overall"])
+        cell_text.append(vals + [d_txt])
+        cell_colors.append(colors + [d_bg])
+        yest_rows = 1
 
-    tbl = ax.table(
-        cellText=cell_text, colLabels=col_labels,
-        cellColours=cell_colors,
-        colColours=[HEADER_BG] * len(col_labels),
-        cellLoc="center", colLoc="center",
-        colWidths=[0.13, 0.13, 0.12, 0.15, 0.13, 0.20],
-        bbox=[0.0, 0.0, 1.0, 1.0],
-    )
-    _style_table(tbl, len(col_labels), tx_for(overall_delta or 0.0))
-
-
-def _decline_share(r: dict, prefix: str, kind: str):
-    n = r.get(f"{prefix}_{kind}Decl")
-    base = r.get(f"{prefix}_AllOrders")
-    if n is None or not base:
-        return n, None
-    return n, 100.0 * n / base
-
-
-def render_declines(ax, rows: dict) -> None:
-    """BUY declines split by who declined: the bank / PSP, or Forter's
-    pre-auth fraud check. Shares are of all BUY orders incl. Forter-blocked."""
-    y = rows["Yesterday"]
-    total_y = sum((y.get(f"{p}_BankDecl") or 0) + (y.get(f"{p}_ForterDecl") or 0)
-                  for p in ("BuyPaid", "BuyUnpaid"))
-    _title(ax, f"BUY DECLINES - {total_y:,} declined orders yesterday")
-
-    cols = [("BuyPaid", "Bank"), ("BuyPaid", "Forter"),
-            ("BuyUnpaid", "Bank"), ("BuyUnpaid", "Forter")]
-    col_labels = ["Period", "Paid: Bank", "Paid: Forter", "Unpaid: Bank", "Unpaid: Forter"]
-    cell_text, cell_colors = [], []
-    for period in PERIODS:
+    for period in PERIODS[1:]:
         r = rows[period]
-        is_yest = (period == "Yesterday")
-        row_vals = [period]
-        row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG]
-        for prefix, kind in cols:
-            n, share = _decline_share(r, prefix, kind)
-            row_vals.append("n/a" if share is None else f"{n:,} ({share:.1f}%)")
-            if not is_yest:
-                row_colors.append("white")
-                continue
-            _, base = _decline_share(rows["Last 7d"], prefix, kind)
-            if share is None or base is None or (r.get(f"{prefix}_AllOrders") or 0) < MIN_SCORED_ORDERS:
-                row_colors.append(LOW_N_BG)
-            else:
-                row_colors.append(bg_for_decline(share - base))
-        cell_text.append(row_vals)
-        cell_colors.append(row_colors)
+        cell_text.append([period] + [_pct(r[f"{prefix}_{c}"]) for c, _ in METRICS] + [""])
+        cell_colors.append([PERIOD_BG] + ["white"] * (len(METRICS) + 1))
 
     tbl = ax.table(
         cellText=cell_text, colLabels=col_labels,
         cellColours=cell_colors,
         colColours=[HEADER_BG] * len(col_labels),
         cellLoc="center", colLoc="center",
-        colWidths=[0.16, 0.21, 0.21, 0.21, 0.21],
+        colWidths=[0.23, 0.12, 0.11, 0.13, 0.11, 0.18] if is_buy
+                  else [0.13, 0.13, 0.12, 0.15, 0.13, 0.20],
         bbox=[0.0, 0.0, 1.0, 1.0],
     )
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(10)
-    for i in range(len(col_labels)):
-        tbl[(0, i)].get_text().set_color(INK)
-        tbl[(0, i)].get_text().set_fontweight("bold")
-    tbl[(1, 0)].get_text().set_color(YEST_PERIOD_TX)
-    tbl[(1, 0)].get_text().set_fontweight("bold")
-    for cell in tbl.get_celld().values():
-        cell.set_edgecolor(PAGE_BG)
-        cell.set_linewidth(1.5)
-
-    ax.text(0.5, -0.13,
-            "Orders (share of all BUY orders in the segment). Bank = issuer / PSP decline. "
-            "Forter = pre-auth fraud block. SUB is not Forter-screened.",
-            ha="center", va="top", transform=ax.transAxes, fontsize=8,
-            style="italic", color=NEUTRAL_TX)
+    _style_table(tbl, len(col_labels), tx_for(delta), yest_rows=yest_rows)
+    if is_buy:
+        for i in range(1, yest_rows + 1):
+            tbl[(i, 0)].get_text().set_fontsize(9)
 
 
 def _footer_lines(rows: dict) -> list:
@@ -262,7 +223,7 @@ def _footer_lines(rows: dict) -> list:
 
 
 def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
-    fig = plt.figure(figsize=(8.5, 13.9), facecolor=PAGE_BG)
+    fig = plt.figure(figsize=(8.5, 13.0), facecolor=PAGE_BG)
     fig.text(0.5, 0.988, f"Payment Success Rates - {report_date}",
              ha="center", va="top", fontsize=20, fontweight="bold", color=INK)
 
@@ -275,17 +236,17 @@ def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
                                           facecolor=bg, edgecolor="none", transform=fig.transFigure))
         fig.text(x + 0.024, y, label, ha="left", va="center", fontsize=10, color=INK)
     fig.text(0.13, y - 0.016,
-             "Declines table inverted: a rising decline share is the warning (+1pp yellow, +3pp red)",
+             "BUY: only the overall success row is scored, vs overall success last 7d. "
+             "Card success excludes Forter-declined orders.",
              ha="left", va="center", fontsize=8.5, style="italic", color=NEUTRAL_TX)
 
-    gs = fig.add_gridspec(len(FUNNELS), 1, top=0.895, bottom=0.06, hspace=0.62)
+    heights = [7 if p in BUY_FUNNELS else 5 for p, _, _ in FUNNELS]
+    gs = fig.add_gridspec(len(FUNNELS), 1, top=0.895, bottom=0.06, hspace=0.45,
+                          height_ratios=heights)
     for i, (prefix, short_title, note) in enumerate(FUNNELS):
         ax = fig.add_subplot(gs[i, 0])
         ax.set_facecolor(PAGE_BG)
-        if prefix == "DECLINES":
-            render_declines(ax, rows)
-        else:
-            render_funnel(ax, prefix, short_title, rows, note=note)
+        render_funnel(ax, prefix, short_title, rows, note=note)
 
     for j, line in enumerate(_footer_lines(rows)):
         fig.text(0.5, 0.024 - j * 0.016, line, ha="center", va="center",

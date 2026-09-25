@@ -21,6 +21,9 @@
 --   SubAll_*    = SUB blended: every SUB order processed (first attempt + dunning
 --                 retries). Each retry is its own recurring order ID charged on a
 --                 single day, so each order counts once on its processing date
+--   <funnel>_AllOrders / <funnel>_Completed = orders attempted / orders completed
+--     (approved on any method). Completed is the number that compares with the
+--     sales reports' paid-order counts.
 --   BUY only, per column <m> in (Overall, CC, AP, PP, AF):
 --     <m>_Fraud     = Forter fraud declines, % of ALL orders (incl. Forter-blocked)
 --     <m>_TotalSucc = overall success, % of ALL orders (incl. Forter-blocked)
@@ -224,6 +227,7 @@ funnel_overall AS (
     COUNTIF(attempt=1)                                                                    AS total_attempts,
     ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate,
     COUNT(*)                                                                    AS all_orders,
+    COUNTIF(success=1)                                                          AS completed_orders,
     ROUND(SAFE_DIVIDE(COUNTIF(success=0 AND forter_block=1), COUNT(*))*100, 2) AS overall_fraud,
     ROUND(SAFE_DIVIDE(COUNTIF(success=1), COUNT(*))*100, 2)                    AS overall_total_succ
   FROM (
@@ -249,21 +253,23 @@ SELECT
   bp.total_attempts AS BuyPaid_Total,   bp.overall_rate AS BuyPaid_Overall,
   bp.CC AS BuyPaid_CC,   bp.AP AS BuyPaid_AP,   bp.PP AS BuyPaid_PP, bp.AF AS BuyPaid_AF,
   bp.CC_N AS BuyPaid_CC_N,   bp.AP_N AS BuyPaid_AP_N,   bp.PP_N AS BuyPaid_PP_N, bp.AF_N AS BuyPaid_AF_N,
-  bp.all_orders AS BuyPaid_AllOrders, bp.overall_fraud AS BuyPaid_Overall_Fraud, bp.overall_total_succ AS BuyPaid_Overall_TotalSucc,
+  bp.all_orders AS BuyPaid_AllOrders, bp.completed_orders AS BuyPaid_Completed, bp.overall_fraud AS BuyPaid_Overall_Fraud, bp.overall_total_succ AS BuyPaid_Overall_TotalSucc,
   bp.CC_Fraud AS BuyPaid_CC_Fraud, bp.AP_Fraud AS BuyPaid_AP_Fraud, bp.PP_Fraud AS BuyPaid_PP_Fraud, bp.AF_Fraud AS BuyPaid_AF_Fraud,
   bp.CC_TotalSucc AS BuyPaid_CC_TotalSucc, bp.AP_TotalSucc AS BuyPaid_AP_TotalSucc, bp.PP_TotalSucc AS BuyPaid_PP_TotalSucc, bp.AF_TotalSucc AS BuyPaid_AF_TotalSucc,
   bp.CC_AllN AS BuyPaid_CC_AllN, bp.AP_AllN AS BuyPaid_AP_AllN, bp.PP_AllN AS BuyPaid_PP_AllN, bp.AF_AllN AS BuyPaid_AF_AllN,
   bu.total_attempts AS BuyUnpaid_Total, bu.overall_rate AS BuyUnpaid_Overall,
   bu.CC AS BuyUnpaid_CC, bu.AP AS BuyUnpaid_AP, bu.PP AS BuyUnpaid_PP, bu.AF AS BuyUnpaid_AF,
   bu.CC_N AS BuyUnpaid_CC_N, bu.AP_N AS BuyUnpaid_AP_N, bu.PP_N AS BuyUnpaid_PP_N, bu.AF_N AS BuyUnpaid_AF_N,
-  bu.all_orders AS BuyUnpaid_AllOrders, bu.overall_fraud AS BuyUnpaid_Overall_Fraud, bu.overall_total_succ AS BuyUnpaid_Overall_TotalSucc,
+  bu.all_orders AS BuyUnpaid_AllOrders, bu.completed_orders AS BuyUnpaid_Completed, bu.overall_fraud AS BuyUnpaid_Overall_Fraud, bu.overall_total_succ AS BuyUnpaid_Overall_TotalSucc,
   bu.CC_Fraud AS BuyUnpaid_CC_Fraud, bu.AP_Fraud AS BuyUnpaid_AP_Fraud, bu.PP_Fraud AS BuyUnpaid_PP_Fraud, bu.AF_Fraud AS BuyUnpaid_AF_Fraud,
   bu.CC_TotalSucc AS BuyUnpaid_CC_TotalSucc, bu.AP_TotalSucc AS BuyUnpaid_AP_TotalSucc, bu.PP_TotalSucc AS BuyUnpaid_PP_TotalSucc, bu.AF_TotalSucc AS BuyUnpaid_AF_TotalSucc,
   bu.CC_AllN AS BuyUnpaid_CC_AllN, bu.AP_AllN AS BuyUnpaid_AP_AllN, bu.PP_AllN AS BuyUnpaid_PP_AllN, bu.AF_AllN AS BuyUnpaid_AF_AllN,
   ROUND(SAFE_DIVIDE(bp.total_attempts, bp.total_attempts + bu.total_attempts)*100, 2) AS BuyPaid_Share,
+  su.all_orders AS Sub_AllOrders, su.completed_orders AS Sub_Completed,
   su.total_attempts AS Sub_Total,       su.overall_rate AS Sub_Overall,
   su.CC AS Sub_CC,       su.AP AS Sub_AP,       su.PP AS Sub_PP, su.AF AS Sub_AF,
   su.CC_N AS Sub_CC_N,       su.AP_N AS Sub_AP_N,       su.PP_N AS Sub_PP_N, su.AF_N AS Sub_AF_N,
+  sa.all_orders AS SubAll_AllOrders, sa.completed_orders AS SubAll_Completed,
   sa.total_attempts AS SubAll_Total,    sa.overall_rate AS SubAll_Overall,
   sa.CC AS SubAll_CC,    sa.AP AS SubAll_AP,    sa.PP AS SubAll_PP, sa.AF AS SubAll_AF,
   sa.CC_N AS SubAll_CC_N,    sa.AP_N AS SubAll_AP_N,    sa.PP_N AS SubAll_PP_N, sa.AF_N AS SubAll_AF_N

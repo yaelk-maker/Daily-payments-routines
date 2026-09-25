@@ -26,6 +26,8 @@ and the columns produced by the SQL:
   <funnel>_Total / <funnel>_Overall / <funnel>_CC / _AP / _PP / _AF
     for <funnel> in BuyPaid, BuyUnpaid, Sub, SubAll  (AF = AfterPay)
   <funnel>_CC_N / _AP_N / _PP_N / _AF_N  (per-method order counts)
+  <funnel>_AllOrders / <funnel>_Completed  (orders attempted / completed yesterday,
+    shown in each table title)
   BUY only: <funnel>_<m>_Fraud / <funnel>_<m>_TotalSucc / <funnel>_<m>_AllN for
   <m> in (Overall, CC, AP, PP, AF), with <funnel>_AllOrders as the Overall count
   BuyPaid_Share
@@ -76,7 +78,7 @@ FUNNELS = [
     ("BuyPaid",   "BUY Paid",   "paid media"),
     ("BuyUnpaid", "BUY Unpaid", "no paid media"),
     ("Sub",       "SUB",        "1st attempt, excl. restarts"),
-    ("SubAll",    "SUB Blended", "all attempts incl. retries"),
+    ("SubAll",    "SUB Blended", "incl. retries"),
 ]
 # one column grid for every table so columns line up down the page
 COL_WIDTHS = [0.21, 0.11, 0.10, 0.12, 0.10, 0.11, 0.16]
@@ -158,8 +160,9 @@ def _delta_cell(v, base):
 def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = None) -> None:
     is_buy = prefix in BUY_FUNNELS
     y, l7 = rows["Yesterday"], rows["Last 7d"]
-    yest_total = (y.get(f"{prefix}_AllOrders") if is_buy else y[f"{prefix}_Total"]) or 0
-    title = f"{short_title} - {yest_total:,} orders yesterday"
+    attempts = y.get(f"{prefix}_AllOrders") or y.get(f"{prefix}_Total") or 0
+    completed = y.get(f"{prefix}_Completed") or 0
+    title = f"{short_title} - {attempts:,} attempts, {completed:,} completed orders"
     if note:
         title += f"  ({note})"
     _title(ax, title)

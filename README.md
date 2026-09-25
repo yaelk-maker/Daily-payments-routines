@@ -56,9 +56,9 @@ Common across all funnels:
 
 | Row | Definition |
 |---|---|
-| Yest. card success | Approved / orders that were **not** Forter-declined. This is the metric in the Last 7d / MTD / Prev month rows. |
+| Yest. card success | Approved / orders that were **not** Forter-declined |
 | Yest. fraud declines | Forter-declined orders / **all** orders. Forter-declined = the order never succeeded and at least one attempt was blocked by Forter's pre-auth fraud check (Spreedly `Message` contains `fraud`: "gateway transaction not attempted due to failed pre authorization fraud check.") |
-| Yest. overall success | Approved / **all** orders, including Forter-declined |
+| Yest. overall success | Approved / **all** orders, including Forter-declined. This is the metric in the Last 7d / MTD / Prev month rows. |
 
 The three reconcile: overall success = card success × (1 − fraud declines). Forter blocks are almost all credit card: from 26 Aug to 24 Sep there was 1 Apple Pay block and 0 PayPal, so Apple Pay and PayPal normally show 0.0% fraud declines. SUB is merchant-initiated and not Forter-screened.
 
@@ -102,5 +102,6 @@ Thresholds (Yesterday vs Last 7d):
 - 🟩 cell: stable / up
 - ⬜ grey cell: fewer than 50 orders yesterday for that payment method, not scored (one decline in 50 is 2pp; splitting BUY in two leaves PayPal and Apple Pay at ~35 to 60 orders a day)
 - Δ text: red when < −0.5pp, green otherwise
+- Δ and colours are computed from the 1dp values shown, so they can be checked against the table
 
-BUY tables: only the `Yest. overall success` row is coloured, and its Δ compares overall success yesterday with overall success over the last 7 days (like-for-like, Forter-declined orders included in both). The card success and fraud decline rows are plain numbers.
+BUY tables: only the `Yest. overall success` row is coloured. Its Δ is yesterday's overall success minus the Last 7d row shown directly below it (both include Forter-declined orders). The card success and fraud decline rows are plain numbers. SUB tables are unchanged: all rows show the SUB success rate.

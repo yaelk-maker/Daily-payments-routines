@@ -41,7 +41,8 @@ does not read as an incident.
 BUY tables show three Yesterday rows: card success (Forter-declined orders
 excluded), Forter fraud declines, and overall success (all orders). Only the
 overall success row is traffic-lighted, against overall success over the last
-7 days. Last 7d / MTD / Prev month show card success.
+7 days. Last 7d / MTD / Prev month show overall success too, so the Δ can be
+read straight off the table.
 """
 
 import json
@@ -138,13 +139,14 @@ def _score(v, base, n) -> str:
     """Traffic-light background for a Yesterday cell, grey when not scorable."""
     if v is None or base is None or (n or 0) < MIN_SCORED_ORDERS:
         return LOW_N_BG
-    return bg_for(v - base)
+    return bg_for(round(v, 1) - round(base, 1))
 
 
 def _delta_cell(v, base):
     if v is None or base is None:
         return "", "white", 0.0
-    d = v - base
+    # computed on the 1dp values shown, so the delta can be checked against the table
+    d = round(round(v, 1) - round(base, 1), 1)
     return f"{'+' if d >= 0 else ''}{d:.1f}pp", bg_for(d), d
 
 
@@ -192,9 +194,11 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
         cell_colors.append(colors + [d_bg])
         yest_rows = 1
 
+    # BUY history rows show overall success, the metric the coloured row is scored on
+    hist_suffix = "_TotalSucc" if is_buy else ""
     for period in PERIODS[1:]:
         r = rows[period]
-        cell_text.append([period] + [_pct(r[f"{prefix}_{c}"]) for c, _ in METRICS] + [""])
+        cell_text.append([period] + [_pct(r.get(f"{prefix}_{c}{hist_suffix}")) for c, _ in METRICS] + [""])
         cell_colors.append([PERIOD_BG] + ["white"] * (len(METRICS) + 1))
 
     tbl = ax.table(
@@ -236,8 +240,8 @@ def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
                                           facecolor=bg, edgecolor="none", transform=fig.transFigure))
         fig.text(x + 0.024, y, label, ha="left", va="center", fontsize=10, color=INK)
     fig.text(0.13, y - 0.016,
-             "BUY: only the overall success row is scored, vs overall success last 7d. "
-             "Card success excludes Forter-declined orders.",
+             "BUY: Last 7d / MTD / Prev month show overall success (incl. Forter-declined orders); "
+             "only that Yesterday row is scored.",
              ha="left", va="center", fontsize=8.5, style="italic", color=NEUTRAL_TX)
 
     heights = [7 if p in BUY_FUNNELS else 5 for p, _, _ in FUNNELS]

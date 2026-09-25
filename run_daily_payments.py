@@ -158,10 +158,10 @@ def build_model(cells: dict) -> dict:
         y = get("Y", "Sub", code)
         base = rate(get("B28", "Sub", code))
         st = score(y, base)
-        m["sub"].append(dict(name=name, v=rate(y), base=base, n=y[0], st=st))
+        m["sub"].append(dict(name=name, v=rate(y), base=base, n=y[0], k=y[1], st=st))
         if st in ("amber", "red"):
             m["flags"].append((st, f"SUB {name} approval: {rate(y)*100:.1f}% vs {base*100:.1f}% "
-                                   f"normal ({y[0]} orders)"))
+                                   f"normal ({y[0]} attempts)"))
     return m
 
 
@@ -268,9 +268,13 @@ def generate_image(cells: dict, report_date: str, out_path: Path) -> None:
     xs = [4 + i * (pw + 1.45) for i in range(3)]
     header(y0, xs, pw, [s["name"] for s in m["sub"]])
     y0 -= 6.2
+    y0 -= 2
     for x, s in zip(xs, m["sub"]):
-        cell(x, y0, pw, 5.6, _pct(s["v"]) if s["n"] else "no orders",
-             f"normal {_pct(s['base'])}  ·  {s['n']} orders", s["st"])
+        box(x, y0, pw, 7.6, FILL[s["st"]], r=0.6)
+        txt(x + pw / 2, y0 + 5.4, _pct(s["v"]) if s["n"] else "no orders", ha="center", fontsize=11)
+        txt(x + pw / 2, y0 + 3.2, f"normal {_pct(s['base'])}", ha="center", fontsize=8, color=NEU2)
+        txt(x + pw / 2, y0 + 1.3, f"{s['n']:,} attempts  ·  {s['k']:,} completed",
+            ha="center", fontsize=8, color=NEU2)
     y0 -= 5
 
     # legend

@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Daily payments routine: BQ results → styled PNG → GitHub raw URL → Slack post.
+Daily payments routine: BQ results → "Payments Daily" PNG → GitHub raw URL → Slack post.
 
 Designed to run inside Claude Code Remote Routine. Two-step flow:
 
   1. The routine executes ``payment method success rates by funnel.sql`` via the
      BigQuery MCP and saves the rows as JSON.
 
-  2. This script reads that JSON, generates ``payments.png`` matching the
-     ``#payments-daily-monitoring`` template, commits + pushes the image to the
-     current branch, and posts a Slack message with an ``image`` block pointing
-     at ``raw.githubusercontent.com``.
+  2. This script reads that JSON, renders ``payments.png``, commits + pushes the
+     image to the current branch, and posts a Slack message with an ``image``
+     block pointing at ``raw.githubusercontent.com``.
 
 Required environment variables:
   SLACK_BOT_TOKEN          — bot token with chat:write
@@ -19,33 +18,25 @@ Required environment variables:
 Usage:
   python run_daily_payments.py <bq_results.json>
   cat bq_results.json | python run_daily_payments.py -
+  python run_daily_payments.py <bq_results.json> --render-only [out.png]   (no git, no Slack)
 
-Expected JSON shape — a list of period rows. Each row has a ``Period`` key
-("P4. Yesterday", "P3. Last 7d", "P2. MTD (excl yesterday)", "P1. Previous month")
-and the columns produced by the SQL:
-  BuyPaid_Total   / BuyPaid_Overall   / BuyPaid_CC   / BuyPaid_AP   / BuyPaid_PP
-  BuyUnpaid_Total / BuyUnpaid_Overall / BuyUnpaid_CC / BuyUnpaid_AP / BuyUnpaid_PP
-  Sub_Total       / Sub_Overall       / Sub_CC       / Sub_AP       / Sub_PP
-  SubAll_Total    / SubAll_Overall    / SubAll_CC    / SubAll_AP    / SubAll_PP
-  <funnel>_CC_N / <funnel>_AP_N / <funnel>_PP_N  (per-method order counts)
-  BUY only: <funnel>_<m>_Fraud / <funnel>_<m>_TotalSucc / <funnel>_<m>_AllN for
-  <m> in (Overall, CC, AP, PP), with <funnel>_AllOrders as the Overall count
-  BuyPaid_Share
+Expected JSON shape — a list of rows with keys
+  report_date, period ('Y' | 'B28'), segment ('BuyPaid' | 'BuyUnpaid' | 'Sub'),
+  dim, n, k
+where dim is 'Overall' (n attempted, k completed), 'CC' / 'AP' / 'PP' / 'AF'
+(BUY, per payment method), 'Forter' (BUY, k = Forter-declined orders) or
+'RN1' / 'RN2-3' / 'RN4+' (SUB, by recurring order number).
 
-TRY was retired on 23 Aug 2026. BUY is split by acquisition source using the
-company MediaPaidType definition (paid media vs everything else). Yesterday's
-per-method cells are only traffic-lighted when they carry at least
-MIN_SCORED_ORDERS orders; smaller cells are greyed out so a single decline
-does not read as an incident.
-
-BUY tables show three Yesterday rows: card success (Forter-declined orders
-excluded), Forter fraud declines, and overall success (all orders). Only the
-overall success row is traffic-lighted, against overall success over the last
-7 days. Last 7d / MTD / Prev month show overall success too, so the Δ can be
-read straight off the table.
+Scoring: yesterday is compared with the previous 28 days ("normal"). A cell is
+coloured only when a move that bad is unlikely to be chance at yesterday's
+volume, by an exact binomial test: amber below 2.3%, red below 0.13% (the
+one-sided equivalents of 2 and 3 standard deviations). SUB is compared with an
+expected rate that adjusts for yesterday's mix of recurring order numbers.
+Every flagged cell is listed in the banner at the top.
 """
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -54,235 +45,254 @@ import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import matplotlib.patches as mpatches
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch, Rectangle
 
 REPO_DIR          = Path(__file__).parent.resolve()
 IMAGE_PATH        = REPO_DIR / "payments.png"
 GITHUB_OWNER_REPO = "yaelk-maker/Daily-payments-routines"
 
-PERIODS = ["Yesterday", "Last 7d", "MTD", "Prev month"]
-PERIOD_FROM_KEY = {
-    "P4. Yesterday":            "Yesterday",
-    "P3. Last 7d":              "Last 7d",
-    "P2. MTD (excl yesterday)": "MTD",
-    "P1. Previous month":       "Prev month",
-}
-METRICS = [("Overall", "Overall"), ("CC", "CC"), ("AP", "Apple Pay"), ("PP", "PayPal")]
-BUY_FUNNELS = {"BuyPaid", "BuyUnpaid"}
-FUNNELS = [
-    ("BuyPaid",   "BUY Paid",   "paid media"),
-    ("BuyUnpaid", "BUY Unpaid", "no paid media"),
-    ("Sub",       "SUB",        "first attempt only"),
-    ("SubAll",    "SUB Blended", "all attempts incl. retries"),
-]
-# one column grid for every table so columns line up down the page
-COL_WIDTHS = [0.23, 0.12, 0.11, 0.13, 0.11, 0.18]
-MIN_SCORED_ORDERS = 50   # yesterday's per-method cells below this are not scored
+BUY_SEGMENTS = [("BuyPaid", "Paid"), ("BuyUnpaid", "Unpaid")]
+METHODS      = [("CC", "Card"), ("AP", "Apple Pay"), ("PP", "PayPal"), ("AF", "AfterPay")]
+SUB_BUCKETS  = [("RN1", "1st recurring order"), ("RN2-3", "2nd to 3rd"), ("RN4+", "4th+")]
+AMBER_P, RED_P = 0.0228, 0.00135
 
 # MAËLYS brand palette (semantic traffic-light colors kept for status)
-INK            = "#120D0E"
-PAGE_BG        = "#FBFAF8"
-HEADER_BG      = "#FFAFC4"
-PERIOD_BG      = "#FFE0E9"
-YEST_PERIOD_BG = "#DB6B8A"
-YEST_PERIOD_TX = "#FBFAF8"
-YEST_SUB_BG    = "#FFE0E9"   # the two extra BUY Yesterday rows
-NEUTRAL_TX     = "#5A524D"
-LOW_N_BG       = "#EBE5E2"
-GREEN_BG, YELLOW_BG, RED_BG = "#A8E0A0", "#FFE99C", "#F5C6CB"
-GREEN_TX, RED_TX            = "#1F7A1F", "#C5283D"
+INK, BG            = "#120D0E", "#FBFAF8"
+PINK, PINK_L       = "#FFAFC4", "#FFE0E9"
+NEU, NEU2, LINE    = "#5A524D", "#968E89", "#EBE5E2"
+AMBER, RED, GREEN  = "#FFE99C", "#F5C6CB", "#A8E0A0"
+AMBER_TX, RED_TX, GREEN_TX = "#8A6A00", "#C5283D", "#1F7A1F"
+FILL = {"red": RED, "amber": AMBER, "ok": "white", "na": "white"}
 
 
-def bg_for(delta: float) -> str:
-    if delta <= -3.0:
-        return RED_BG
-    if delta <= -1.0:
-        return YELLOW_BG
-    return GREEN_BG
+# ---------- statistics ----------
+
+def _log_pmf(i: int, n: int, p: float) -> float:
+    return (math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1)
+            + i * math.log(p) + (n - i) * math.log1p(-p))
 
 
-def tx_for(delta: float) -> str:
-    return RED_TX if delta < -0.5 else GREEN_TX
+def tail_p(k: int, n: int, p: float, upper: bool = False) -> float:
+    """Exact one-sided binomial tail: P(X <= k), or P(X >= k) when upper."""
+    if n <= 0 or p is None or p <= 0 or p >= 1:
+        return 1.0
+    rng = range(k, n + 1) if upper else range(0, k + 1)
+    return min(1.0, sum(math.exp(_log_pmf(i, n, p)) for i in rng))
 
 
-def _style_table(tbl, n_cols: int, yest_delta_tx: str, yest_rows: int = 1) -> None:
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(10)
-    for i in range(n_cols):
-        h = tbl[(0, i)]
-        h.get_text().set_color(INK)
-        h.get_text().set_fontweight("bold")
-    for i in range(1, yest_rows + 1):
-        yc = tbl[(i, 0)]
-        yc.get_text().set_color(YEST_PERIOD_TX if i == yest_rows else INK)
-        yc.get_text().set_fontweight("bold")
-    dc = tbl[(yest_rows, n_cols - 1)]
-    dc.get_text().set_color(yest_delta_tx)
-    dc.get_text().set_fontweight("bold")
-    for cell in tbl.get_celld().values():
-        cell.set_edgecolor(PAGE_BG)
-        cell.set_linewidth(1.5)
+def status(pv: float) -> str:
+    return "red" if pv < RED_P else "amber" if pv < AMBER_P else "ok"
 
 
-def _title(ax, text: str) -> None:
-    ax.axis("off")
-    ax.text(0.5, 1.05, text, ha="center", va="bottom",
-            transform=ax.transAxes, fontsize=12, fontweight="bold", color=INK)
-    ax.plot([0.18, 0.82], [1.02, 1.02], color=INK, linewidth=1.4,
-            transform=ax.transAxes, clip_on=False)
+def rate(nk):
+    n, k = nk
+    return k / n if n else None
 
+
+# ---------- data ----------
+
+def parse_rows(raw_rows: list):
+    cells, report_date = {}, None
+    for r in raw_rows:
+        report_date = report_date or r.get("report_date")
+        cells[(r["period"], r["segment"], r["dim"])] = (int(r["n"] or 0), int(r["k"] or 0))
+    if not any(p == "Y" for p, _, _ in cells):
+        raise SystemExit("BQ results have no rows for yesterday (period 'Y')")
+    return cells, str(report_date) if report_date else yesterday_date_il()
+
+
+def build_model(cells: dict) -> dict:
+    def get(p, s, d):
+        return cells.get((p, s, d), (0, 0))
+
+    def score(y, base, upper=False):
+        if not y[0]:
+            return "na"
+        if base is None:
+            return "ok"
+        return status(tail_p(y[1], y[0], base, upper=upper))
+
+    m = {"tiles": [], "buy": {}, "sub": [], "flags": []}
+
+    # headline tiles: BUY vs its 28-day rate, SUB vs the rate expected for yesterday's mix
+    for seg, label in (("BuyPaid", "BUY Paid"), ("BuyUnpaid", "BUY Unpaid")):
+        y = get("Y", seg, "Overall")
+        base = rate(get("B28", seg, "Overall"))
+        m["tiles"].append(dict(label=label, n=y[0], k=y[1], v=rate(y), base=base,
+                               basis="normal", st=score(y, base)))
+    y = get("Y", "Sub", "Overall")
+    exp_k = sum(get("Y", "Sub", d)[0] * (rate(get("B28", "Sub", d)) or 0) for d, _ in SUB_BUCKETS)
+    exp = exp_k / y[0] if y[0] else None
+    m["tiles"].append(dict(label="SUB first attempt", n=y[0], k=y[1], v=rate(y), base=exp,
+                           basis="expected", st=score(y, exp)))
+    for t in m["tiles"]:
+        if t["st"] in ("amber", "red"):
+            m["flags"].append((t["st"], f"{t['label']}: {t['v']*100:.1f}% vs {t['base']*100:.1f}% "
+                                            f"{t['basis']} ({t['n']:,} attempts)"))
+
+    # BUY by payment method + Forter blocks
+    for seg, label in BUY_SEGMENTS:
+        row = []
+        for code, name in METHODS:
+            y = get("Y", seg, code)
+            base = rate(get("B28", seg, code))
+            st = score(y, base)
+            row.append(dict(v=rate(y), base=base, n=y[0], st=st))
+            if st in ("amber", "red"):
+                m["flags"].append((st, f"BUY {label} {name.lower() if code == 'CC' else name} approval: "
+                                       f"{rate(y)*100:.1f}% vs {base*100:.1f}% normal ({y[0]} orders)"))
+        y = get("Y", seg, "Forter")
+        base = rate(get("B28", seg, "Forter"))
+        st = score(y, base, upper=True)
+        row.append(dict(count=y[1], v=rate(y), base=base, n=y[0], st=st))
+        if st in ("amber", "red"):
+            m["flags"].append((st, f"Forter blocks on BUY {label}: {y[1]} orders ({rate(y)*100:.1f}%) "
+                                   f"vs {base*100:.1f}% normal"))
+        m["buy"][label] = row
+
+    # SUB by recurring order number
+    for code, name in SUB_BUCKETS:
+        y = get("Y", "Sub", code)
+        base = rate(get("B28", "Sub", code))
+        st = score(y, base)
+        m["sub"].append(dict(name=name, v=rate(y), base=base, n=y[0], st=st))
+        if st in ("amber", "red"):
+            m["flags"].append((st, f"SUB {name} approval: {rate(y)*100:.1f}% vs {base*100:.1f}% "
+                                   f"normal ({y[0]} orders)"))
+    return m
+
+
+# ---------- drawing ----------
 
 def _pct(v) -> str:
-    return "n/a" if v is None else f"{v:.1f}%"
+    return "n/a" if v is None else f"{v*100:.1f}%"
 
 
-def _score(v, base, n) -> str:
-    """Traffic-light background for a Yesterday cell, grey when not scorable."""
-    if v is None or base is None or (n or 0) < MIN_SCORED_ORDERS:
-        return LOW_N_BG
-    return bg_for(round(v, 1) - round(base, 1))
+def generate_image(cells: dict, report_date: str, out_path: Path) -> None:
+    m = build_model(cells)
+    fig = plt.figure(figsize=(8.5, 10.6), facecolor=BG)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 125)
+    ax.axis("off")
 
+    def txt(x, y, s, **k):
+        k.setdefault("color", INK)
+        k.setdefault("fontsize", 10)
+        k.setdefault("va", "center")
+        ax.text(x, y, s, **k)
 
-def _delta_cell(v, base):
-    if v is None or base is None:
-        return "", "white", 0.0
-    # computed on the 1dp values shown, so the delta can be checked against the table
-    d = round(round(v, 1) - round(base, 1), 1)
-    return f"{'+' if d >= 0 else ''}{d:.1f}pp", bg_for(d), d
+    def box(x, y, w, h, fc, ec=LINE, r=1.2):
+        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle=f"round,pad=0,rounding_size={r}",
+                                    fc=fc, ec=ec, lw=1.0))
 
+    def cell(x, y, w, h, value, sub, st):
+        box(x, y, w, h, FILL[st], r=0.6)
+        txt(x + w / 2, y + h * 0.62, value, ha="center", fontsize=11)
+        txt(x + w / 2, y + h * 0.25, sub, ha="center", fontsize=8, color=NEU2)
 
-def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = None) -> None:
-    is_buy = prefix in BUY_FUNNELS
-    y, l7 = rows["Yesterday"], rows["Last 7d"]
-    yest_total = (y.get(f"{prefix}_AllOrders") if is_buy else y[f"{prefix}_Total"]) or 0
-    title = f"{short_title} - {yest_total:,} orders yesterday"
-    if note:
-        title += f"  ({note})"
-    _title(ax, title)
+    def header(y, xs, w, labels):
+        for x, l in zip(xs, labels):
+            box(x, y, w, 3.4, PINK, ec="none", r=0.6)
+            txt(x + w / 2, y + 1.7, l, ha="center", fontsize=9.5, fontweight="bold")
 
-    col_labels = ["Period"] + [m[1] for m in METRICS] + ["Δ Overall vs 7d"]
-    cell_text, cell_colors = [], []
+    def section(y, title, note):
+        txt(4, y, title, fontsize=12, fontweight="bold")
+        txt(96, y, note, fontsize=8.5, color=NEU2, ha="right", style="italic")
 
-    def n_for(r, code, all_orders):
-        if code == "Overall":
-            return r.get(f"{prefix}_AllOrders") if all_orders else r[f"{prefix}_Total"]
-        return r.get(f"{prefix}_{code}_AllN" if all_orders else f"{prefix}_{code}_N")
+    d = datetime.strptime(report_date, "%Y-%m-%d")
+    txt(4, 120.5, "Payments Daily", fontsize=20, fontweight="bold")
+    txt(96, 120.5, d.strftime("%a %d %b %Y") + "  ·  US", fontsize=11, color=NEU, ha="right")
 
-    if is_buy:
-        # Row 1: card success, row 2: Forter fraud declines (plain numbers)
-        for label, suffix in (("Yest. card success", ""), ("Yest. fraud declines", "_Fraud")):
-            cell_text.append([label] + [_pct(y.get(f"{prefix}_{c}{suffix}")) for c, _ in METRICS] + [""])
-            cell_colors.append([YEST_SUB_BG] + ["white"] * (len(METRICS) + 1))
-        # Row 3: overall success incl. Forter-blocked, scored vs the same metric last 7d
-        vals, colors = ["Yest. overall success"], [YEST_PERIOD_BG]
-        for code, _ in METRICS:
-            v, base = y.get(f"{prefix}_{code}_TotalSucc"), l7.get(f"{prefix}_{code}_TotalSucc")
-            vals.append(_pct(v))
-            colors.append(_score(v, base, n_for(y, code, True)))
-        d_txt, d_bg, delta = _delta_cell(y.get(f"{prefix}_Overall_TotalSucc"),
-                                         l7.get(f"{prefix}_Overall_TotalSucc"))
-        cell_text.append(vals + [d_txt])
-        cell_colors.append(colors + [d_bg])
-        yest_rows = 3
-    else:
-        vals, colors = ["Yesterday"], [YEST_PERIOD_BG]
-        for code, _ in METRICS:
-            v, base = y[f"{prefix}_{code}"], l7[f"{prefix}_{code}"]
-            vals.append(_pct(v))
-            colors.append(_score(v, base, n_for(y, code, False)))
-        d_txt, d_bg, delta = _delta_cell(y[f"{prefix}_Overall"], l7[f"{prefix}_Overall"])
-        cell_text.append(vals + [d_txt])
-        cell_colors.append(colors + [d_bg])
-        yest_rows = 1
+    # banner: every flagged cell (red items first), or "All normal"
+    flags = sorted(m["flags"], key=lambda f: f[0] != "red")
+    any_red = any(sev == "red" for sev, _ in flags)
+    bh = 4.2 + 3.4 * len(flags)
+    box(4, 116 - bh, 92, bh, (RED if any_red else AMBER) if flags else GREEN, ec="none")
+    head = f"{len(flags)} item{'s' if len(flags) > 1 else ''} to check" if flags else "All normal"
+    txt(6.5, 116 - (2.6 if flags else bh / 2), head, fontsize=12, fontweight="bold",
+        color=(RED_TX if any_red else AMBER_TX) if flags else GREEN_TX)
+    for i, (sev, f) in enumerate(flags):
+        txt(6.5, 116 - 6.2 - 3.4 * i, ("●  " if sev == "red" else "•  ") + f, fontsize=10)
+    y0 = 116 - bh - 3
 
-    # BUY history rows show overall success, the metric the coloured row is scored on
-    hist_suffix = "_TotalSucc" if is_buy else ""
-    for period in PERIODS[1:]:
-        r = rows[period]
-        cell_text.append([period] + [_pct(r.get(f"{prefix}_{c}{hist_suffix}")) for c, _ in METRICS] + [""])
-        cell_colors.append([PERIOD_BG] + ["white"] * (len(METRICS) + 1))
+    # headline tiles
+    tw, gap = 28.7, 3
+    for i, t in enumerate(m["tiles"]):
+        x = 4 + i * (tw + gap)
+        box(x, y0 - 17, tw, 17, "white")
+        if t["st"] in ("amber", "red"):
+            ax.add_patch(Rectangle((x, y0 - 17), 1.1, 17,
+                                   fc="#E0B400" if t["st"] == "amber" else RED_TX, ec="none"))
+        txt(x + 3, y0 - 3.2, t["label"], fontsize=10, color=NEU, fontweight="bold")
+        txt(x + 3, y0 - 8.6, _pct(t["v"]), fontsize=22, fontweight="bold")
+        if t["v"] is not None and t["base"] is not None:
+            dpp = round(t["v"] * 100, 1) - round(t["base"] * 100, 1)
+            txt(x + 3, y0 - 13.2, f"{t['basis']} {t['base']*100:.1f}%   Δ {dpp:+.1f}pp",
+                fontsize=9, color=NEU)
+        txt(x + 3, y0 - 15.6, f"{t['n']:,} attempts  ·  {t['k']:,} completed",
+            fontsize=8.5, color=NEU2)
+    y0 -= 22
 
-    tbl = ax.table(
-        cellText=cell_text, colLabels=col_labels,
-        cellColours=cell_colors,
-        colColours=[HEADER_BG] * len(col_labels),
-        cellLoc="center", colLoc="center",
-        colWidths=COL_WIDTHS,
-        bbox=[0.0, 0.0, 1.0, 1.0],
-    )
-    _style_table(tbl, len(col_labels), tx_for(delta), yest_rows=yest_rows)
-    if is_buy:
-        for i in range(1, yest_rows + 1):
-            tbl[(i, 0)].get_text().set_fontsize(9)
+    # BUY by payment method
+    section(y0, "BUY approval by payment method", "overall success, Forter blocks included")
+    y0 -= 5.5
+    lw_ = 12
+    cw = (96 - 4 - lw_ - 0.6 * 5) / 5
+    xs = [4 + lw_ + 0.6 + i * (cw + 0.6) for i in range(5)]
+    header(y0, xs, cw, [name for _, name in METHODS] + ["Forter blocks"])
+    y0 -= 0.6
+    for label, row in m["buy"].items():
+        y0 -= 6.2
+        box(4, y0, lw_, 5.6, PINK_L, ec="none", r=0.6)
+        txt(4 + lw_ / 2, y0 + 2.8, label, ha="center", fontsize=10.5, fontweight="bold")
+        for x, c in zip(xs[:4], row[:4]):
+            value = _pct(c["v"]) if c["n"] else "no orders"
+            cell(x, y0, cw, 5.6, value, f"normal {_pct(c['base'])}  ·  {c['n']}", c["st"])
+        f = row[4]
+        cell(xs[4], y0, cw, 5.6, f"{f['count']}  ({_pct(f['v'])})",
+             f"normal {_pct(f['base'])}", f["st"])
+    y0 -= 3
+    txt(4, y0, "Cells: approval on that method · normal = previous 28 days · orders yesterday. "
+               "Tiles count each order once.", fontsize=8.5, color=NEU2, style="italic")
+    y0 -= 6.5
 
+    # SUB by recurring order number
+    section(y0, "SUB first attempt by recurring order",
+            "regular monthly charge, failed-month restarts excluded")
+    y0 -= 5.5
+    pw = 29.7
+    xs = [4 + i * (pw + 1.45) for i in range(3)]
+    header(y0, xs, pw, [s["name"] for s in m["sub"]])
+    y0 -= 6.2
+    for x, s in zip(xs, m["sub"]):
+        cell(x, y0, pw, 5.6, _pct(s["v"]) if s["n"] else "no orders",
+             f"normal {_pct(s['base'])}  ·  {s['n']} orders", s["st"])
+    y0 -= 5
 
-def _footer_lines(rows: dict) -> list:
-    y, l7 = rows["Yesterday"], rows["Last 7d"]
-    share_y, share_7 = y.get("BuyPaid_Share"), l7.get("BuyPaid_Share")
-    lines = []
-    if share_y is not None and share_7 is not None:
-        lines.append(f"BUY mix: paid media {share_y:.1f}% of BUY orders yesterday "
-                     f"vs {share_7:.1f}% last 7d.")
-    return lines
+    # legend
+    ax.plot([4, 96], [y0, y0], color=LINE, lw=1)
+    y0 -= 3
+    for i, (fc, lab) in enumerate([("white", "within normal range"),
+                                   (AMBER, "unusual (< 2.3% chance)"),
+                                   (RED, "very unusual (< 0.1% chance)")]):
+        x = 4 + i * 30
+        box(x, y0 - 1.1, 3, 2.2, fc, r=0.4)
+        txt(x + 4.2, y0, lab, fontsize=9, color=NEU)
+    txt(4, y0 - 4, "US only. BUY Paid = paid-media source or a new customer's first order "
+                   "(Analysis report rule).", fontsize=8.5, color=NEU2, style="italic")
+    txt(4, y0 - 7, "Normal = previous 28 days. Colour only when a move is unlikely to be chance "
+                   "at yesterday's volume (exact binomial test).", fontsize=8.5, color=NEU2, style="italic")
+    ax.set_ylim(y0 - 10, 125)
 
-
-def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
-    fig = plt.figure(figsize=(8.5, 13.0), facecolor=PAGE_BG)
-    fig.text(0.5, 0.988, f"Payment Success Rates - {report_date}",
-             ha="center", va="top", fontsize=20, fontweight="bold", color=INK)
-
-    y = 0.948
-    fig.text(0.13, y, "Delta vs Last 7d:", ha="left", va="center", fontsize=10, color=NEUTRAL_TX)
-    for x, bg, label in [(0.29, GREEN_BG, "stable / up"), (0.43, YELLOW_BG, "-1 to -3pp"),
-                         (0.57, RED_BG, "> -3pp drop"),
-                         (0.71, LOW_N_BG, f"< {MIN_SCORED_ORDERS} orders")]:
-        fig.add_artist(mpatches.Rectangle((x, y - 0.008), 0.018, 0.016,
-                                          facecolor=bg, edgecolor="none", transform=fig.transFigure))
-        fig.text(x + 0.024, y, label, ha="left", va="center", fontsize=10, color=INK)
-    fig.text(0.13, y - 0.016,
-             "BUY: Last 7d / MTD / Prev month show overall success (incl. Forter-declined orders); "
-             "only that Yesterday row is scored.",
-             ha="left", va="center", fontsize=8.5, style="italic", color=NEUTRAL_TX)
-
-    heights = [7 if p in BUY_FUNNELS else 5 for p, _, _ in FUNNELS]
-    gs = fig.add_gridspec(len(FUNNELS), 1, top=0.895, bottom=0.06, hspace=0.45,
-                          height_ratios=heights)
-    for i, (prefix, short_title, note) in enumerate(FUNNELS):
-        ax = fig.add_subplot(gs[i, 0])
-        ax.set_facecolor(PAGE_BG)
-        render_funnel(ax, prefix, short_title, rows, note=note)
-
-    for j, line in enumerate(_footer_lines(rows)):
-        fig.text(0.5, 0.024 - j * 0.016, line, ha="center", va="center",
-                 fontsize=8.5, style="italic", color=NEUTRAL_TX)
-
-    plt.savefig(out_path, dpi=170, bbox_inches="tight", facecolor=PAGE_BG)
+    plt.savefig(out_path, dpi=170, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
 
 
-def _num(v):
-    """BQ JSON may carry numbers as strings; NULL stays None."""
-    if v is None or isinstance(v, (int, float)):
-        return v
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return v
-    return int(f) if f.is_integer() and "." not in str(v) else f
-
-
-def parse_rows(raw_rows: list) -> dict:
-    out = {}
-    for r in raw_rows:
-        r = {k: (v if k == "Period" else _num(v)) for k, v in r.items()}
-        period = PERIOD_FROM_KEY.get(r.get("Period"), r.get("Period"))
-        out[period] = r
-    missing = set(PERIODS) - set(out)
-    if missing:
-        raise SystemExit(f"BQ results missing periods: {sorted(missing)}")
-    return out
-
+# ---------- publish ----------
 
 def git_commit_push(message: str) -> str:
     branch = subprocess.check_output(
@@ -302,7 +312,7 @@ def git_commit_push(message: str) -> str:
 def post_to_slack(image_url: str, report_date: str) -> str:
     token   = os.environ["SLACK_BOT_TOKEN"]
     channel = os.environ["SLACK_CHANNEL_PAYMENTS"]
-    title   = f"Payment Success Rates - {report_date}"
+    title   = f"Payments Daily - {report_date}"
     payload = json.dumps({
         "channel": channel,
         "text":    title,
@@ -330,14 +340,21 @@ def yesterday_date_il() -> str:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        sys.exit("Usage: run_daily_payments.py <bq_results.json | ->")
-    raw = sys.stdin.read() if sys.argv[1] == "-" else Path(sys.argv[1]).read_text()
-    rows = parse_rows(json.loads(raw))
+    args = sys.argv[1:]
+    if not args:
+        sys.exit("Usage: run_daily_payments.py <bq_results.json | -> [--render-only [out.png]]")
+    raw = sys.stdin.read() if args[0] == "-" else Path(args[0]).read_text()
+    cells, report_date = parse_rows(json.loads(raw))
 
-    report_date = yesterday_date_il()
+    if "--render-only" in args:
+        i = args.index("--render-only")
+        out = Path(args[i + 1]) if len(args) > i + 1 else IMAGE_PATH
+        generate_image(cells, report_date, out)
+        print(f"Rendered {out}")
+        return
+
     print(f"Generating image -> {IMAGE_PATH}")
-    generate_image(rows, report_date, IMAGE_PATH)
+    generate_image(cells, report_date, IMAGE_PATH)
 
     print("Committing and pushing image...")
     branch = git_commit_push(f"Daily payments report — {report_date}")

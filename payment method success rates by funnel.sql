@@ -1,34 +1,42 @@
 -- ============================================================
 -- PAYMENT METHOD SUCCESS RATES BY FUNNEL
 -- ============================================================
--- Output: 4 rows (periods) × 5 columns per funnel
--- Funnels: TRY Auth | TRY Shipping | BUY (excl. prepaid-converted) | PREPAID CONVERTED | SUB
+-- Output: 4 rows (periods) × 3 funnels × (Total, Overall, CC, AP, PP + per-method
+--         attempt counts *_N, used by the image to skip scoring low-sample cells)
+-- Funnels: BUY Paid | BUY Unpaid | SUB
 -- Payment methods: Credit Card | Apple Pay | PayPal
 --
--- BUY split (added 2026-07): orders flagged OrdersNew_v.PrepaidConverted are
--- customers who entered the TRY funnel with a prepaid card and were rerouted
--- to BUY by the internal mechanism (prepaid not accepted on TRY). This pool
--- approves at ~19-27% (vs ~95-96% regular BUY) and its volume surges at every
--- month start, so it is reported separately as an acquisition-quality signal:
---   BuyReg_*   = BUY excluding prepaid-converted (payments-health signal)
---   Prepaid_*  = prepaid-converted orders (Total, Rate, Share of BUY)
---   Buy_Blended_Overall = old blended BUY overall, kept for continuity
+-- 2026-09 redesign: MAËLYS stopped selling through TRY on 23 Aug 2026. The TRY
+-- Auth / TRY Shipping / Prepaid-converted tables were retired (TRY fell from
+-- ~600-2,300 orders/day to single digits; prepaid-converted to ~0-8/day) and
+-- BUY is now split by acquisition source, matching the company KPIs:
+--   BuyPaid_*   = BUY orders whose UTMs classify as paid media
+--   BuyUnpaid_* = BUY orders that did not come from paid media
+--   Sub_*       = subscription recurring charges, first billing attempt only
+--   Try_Residual_Orders = orders with a TRY auth attempt (guard: expected ~0)
 --
--- Methodology:
---   TRY Auth/Shipping — aligned with Redash #1610 (TBYB Success Rate Timeline)
---     - QUALIFY MAX(TransactionType)=7 for TRY order identification
---     - PP AUTH_MODIFIED via window function (failed AO + lower amount)
---     - Shipping = CAPTURE_SHIPPING only (CAPTURE_FOLLOW_UP/FORCE_CAPTURE excluded)
---     - CC fraud-blocked excluded from shipping denominator
---     - Apple Pay $0-amount auth attempts excluded (matching #1610)
---     - Date attribution: DATE(TransactionTime), matching #1610 (no TZ conversion)
---   BUY/SUB — aligned with Redash #1613 (BUY Success Rate Timeline)
---     - TransactionType=0 (Receipt), CAPTURE_FULL stage
---     - SUB = SitePart IN (10,12) or Spreedly Metadata_order_type='SUB'
---     - BUY = everything else (COALESCE fallback='BUY')
---     - CC fraud-blocked excluded from denominator
---     - NOTE: SUB rate = same-day billing success; remaining orders enter dunning
---       and may succeed on subsequent days. Use for anomaly detection, not final rates.
+-- Paid / Unpaid split — company definition, identical to
+-- aas_equivalent.FS_STATIC.MediaPaidType / Orders_s.MediaPaidType / Live Report v2:
+--   media_paid_type(source_naming(UtmSource, UtmMedium, UtmCampaign))
+--   Unpaid ('Non-Paid') = Organic / Direct, CRM, Search (unpaid Google), Other
+--   Paid                = everything else: Facebook, YouTube, Applovin, Snapchat,
+--                         TikTok, Bing, PaidSearch, Affiliate (+ any new source)
+--   Applied to the order's own UTMs (cdc.OrdersNew_v), so failed-payment orders
+--   are classified too (FS_STATIC only holds paid orders).
+--
+-- Methodology (BUY/SUB) — aligned with Redash #1613 (BUY Success Rate Timeline)
+--   - TransactionType=0 (Receipt), CAPTURE_FULL stage
+--   - SUB = SitePart IN (10,12) or Spreedly Metadata_order_type='SUB'
+--   - BUY = everything else (COALESCE fallback='BUY')
+--   - TRY orders (cdc.TbybOrders_v, or any TRY auth TransactionType=7 in the
+--     window) are excluded from BUY/SUB, so TRY shipping / post-trial charges
+--     without Spreedly metadata (PayPal) cannot fall through the 'BUY' fallback
+--   - PrepaidConverted orders (TRY->BUY reroute, ~20% approval) excluded from
+--     BUY; the flow ended with TRY and is no longer reported
+--   - CC fraud-blocked excluded from denominator
+--   - SUB restricted to first billing attempt per cycle (AttemptsAmount=1)
+--   - NOTE: SUB rate = same-day billing success; remaining orders enter dunning
+--     and may succeed on subsequent days. Use for anomaly detection, not final rates.
 --
 -- All funnels:
 --   - Order-level dedup (MAX) per payment method for per-method rates
@@ -49,116 +57,9 @@ periods AS (
   SELECT 'P4. Yesterday',            yesterday, yesterday, 4 FROM params
 ),
 
--- ========== TRY (#1610 methodology) ==========
-try_raw AS (
-  SELECT pt.OrderID, pt.TransactionTime, pt.TransactionType,
-    CASE WHEN s.Succeeded='True' THEN true WHEN s.Succeeded='False' THEN false ELSE pt.IsSuccessful END AS succeeded,
-    CASE WHEN IFNULL(LOWER(s.Message),'') LIKE '%fraud%' THEN true ELSE false END AS fraud_flag,
-    COALESCE(s.Metadata_sub_transaction_type,
-      CASE WHEN pt.TransactionType=7              THEN 'AUTH_ORIGINAL'
-           WHEN pt.TransactionType=0 AND pt.Sum<10 THEN 'CAPTURE_SHIPPING'
-           ELSE                                        'CAPTURE_FOLLOW_UP' END) AS sub_type,
-    CASE WHEN LOWER(pt.EcType) LIKE '%paypal%'   THEN 'PayPal'
-         WHEN LOWER(pt.EcType) LIKE '%applepay%' THEN 'Apple Pay'
-         ELSE                                         'Credit Card' END AS pmt_method,
-    CASE WHEN LOWER(pt.EcType) LIKE '%paypal%' THEN 'PayPal' ELSE 'Spreedly' END AS provider,
-    pt.Sum AS amt
-  FROM `cdc.PaymentTransactions_v` pt
-  LEFT JOIN `spreedly.transaction_report_v` s ON pt.OrchestratorToken = s.token
-  WHERE pt.TransactionType IN (0,7) AND pt.Sum > 0
-  QUALIFY MAX(pt.TransactionType) OVER (PARTITION BY pt.OrderID) = 7
-),
-try_trans AS (
-  SELECT *,
-    -- DATE(TransactionTime) matches Redash #1610 (no timezone conversion)
-    MIN(DATE(TransactionTime)) OVER (PARTITION BY OrderID) AS first_date,
-    CASE
-      WHEN provider='PayPal' AND TransactionType=7 AND sub_type='AUTH_ORIGINAL'
-        AND MAX(CASE WHEN TransactionType=7 AND NOT succeeded THEN 1 ELSE 0 END)
-            OVER (PARTITION BY OrderID ORDER BY TransactionTime
-                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) = 1
-        AND amt < FIRST_VALUE(CASE WHEN TransactionType=7 THEN amt END IGNORE NULLS)
-            OVER (PARTITION BY OrderID ORDER BY TransactionTime
-                  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
-      THEN 'AUTH_MODIFIED' ELSE sub_type
-    END AS sub_type_final,
-    CASE
-      WHEN provider='PayPal' AND TransactionType=0 AND amt>10
-        AND TransactionTime=MAX(CASE WHEN TransactionType=0 AND amt>10
-            THEN TransactionTime END) OVER (PARTITION BY OrderID)
-      THEN true ELSE false
-    END AS is_pp_followup
-  FROM try_raw
-),
-try_tagged AS (
-  SELECT t.*, p.period, p.sort_order
-  FROM try_trans t
-  JOIN periods p ON t.first_date BETWEEN p.d_start AND p.d_end
-),
-
--- TRY AUTH: combined (AO or AM succeeded) / AO attempts
--- Apple Pay $0-amount auths excluded from attempt + success (matching #1610)
-try_auth_order AS (
-  SELECT period, sort_order, OrderID, pmt_method,
-    MAX(CASE WHEN sub_type_final='AUTH_ORIGINAL'
-             AND NOT (pmt_method='Apple Pay' AND amt=0) THEN 1 ELSE 0 END) AS ao_attempt,
-    MAX(CASE WHEN sub_type_final IN ('AUTH_ORIGINAL','AUTH_MODIFIED')
-             AND NOT (pmt_method='Apple Pay' AND amt=0)
-             AND succeeded                              THEN 1 ELSE 0 END) AS auth_success
-  FROM try_tagged
-  WHERE TransactionType=7 AND sub_type_final IN ('AUTH_ORIGINAL','AUTH_MODIFIED')
-  GROUP BY period, sort_order, OrderID, pmt_method
-),
-try_auth_pivot AS (
-  SELECT period, sort_order,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND auth_success=1), COUNTIF(pmt_method='Credit Card' AND ao_attempt=1))*100, 2) AS CC,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND auth_success=1), COUNTIF(pmt_method='Apple Pay'   AND ao_attempt=1))*100, 2) AS AP,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND auth_success=1), COUNTIF(pmt_method='PayPal'      AND ao_attempt=1))*100, 2) AS PP
-  FROM try_auth_order GROUP BY period, sort_order
-),
-try_auth_overall AS (
-  SELECT period, sort_order,
-    COUNTIF(ao_attempt=1)                                                                    AS total_attempts,
-    ROUND(SAFE_DIVIDE(COUNTIF(ao_attempt=1 AND auth_success=1), COUNTIF(ao_attempt=1))*100, 2) AS overall_rate
-  FROM (
-    SELECT period, sort_order, OrderID,
-      MAX(ao_attempt) AS ao_attempt, MAX(auth_success) AS auth_success
-    FROM try_auth_order GROUP BY period, sort_order, OrderID
-  )
-  GROUP BY period, sort_order
-),
-
--- TRY SHIPPING: success / attempts on CAPTURE_SHIPPING only (CC fraud excluded from denom)
-try_ship_order AS (
-  SELECT period, sort_order, OrderID, pmt_method,
-    MAX(CASE WHEN pmt_method!='Credit Card' OR (succeeded OR NOT fraud_flag) THEN 1 ELSE 0 END) AS attempt,
-    MAX(CASE WHEN succeeded THEN 1 ELSE 0 END) AS success
-  FROM try_tagged
-  WHERE sub_type_final = 'CAPTURE_SHIPPING'
-  GROUP BY period, sort_order, OrderID, pmt_method
-),
-try_ship_pivot AS (
-  SELECT period, sort_order,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 2) AS CC,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 2) AS AP,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 2) AS PP
-  FROM try_ship_order GROUP BY period, sort_order
-),
-try_ship_overall AS (
-  SELECT period, sort_order,
-    COUNTIF(attempt=1)                                                                    AS total_attempts,
-    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
-  FROM (
-    SELECT period, sort_order, OrderID,
-      MAX(attempt) AS attempt, MAX(success) AS success
-    FROM try_ship_order GROUP BY period, sort_order, OrderID
-  )
-  GROUP BY period, sort_order
-),
-
 -- ========== BUY + SUB (#1613 methodology) ==========
 buy_sub_raw AS (
-  SELECT pt.OrderID, pt.TransactionTime,
+  SELECT pt.OrderID, pt.TransactionTime, pt.TransactionType,
     CASE WHEN s.Succeeded='True' THEN true WHEN s.Succeeded='False' THEN false ELSE pt.IsSuccessful END AS succeeded,
     CASE WHEN IFNULL(LOWER(s.Message),'') LIKE '%fraud%' THEN true ELSE false END AS fraud_flag,
     COALESCE(s.Metadata_sub_transaction_type,'CAPTURE_FULL') AS sub_type,
@@ -168,19 +69,36 @@ buy_sub_raw AS (
     CASE WHEN LOWER(pt.EcType) LIKE '%paypal%' THEN true ELSE false END AS is_paypal,
     pt.Sum AS amt,
     COALESCE(s.Metadata_order_type, o.order_type, 'BUY') AS order_type,
-    IFNULL(o.prepaid_conv, FALSE) AS prepaid_conv
+    IFNULL(o.prepaid_conv, FALSE) AS prepaid_conv,
+    o.media,
+    tb.OrderId IS NOT NULL AS is_try,
+    MAX(pt.TransactionType) OVER (PARTITION BY pt.OrderID) AS max_tt
   FROM `cdc.PaymentTransactions_v` pt
   LEFT JOIN `spreedly.transaction_report_v` s ON pt.OrchestratorToken = s.token
   LEFT JOIN (
     SELECT ID AS OrderID,
            CASE WHEN SitePart IN (10,12) THEN 'SUB' END AS order_type,
-           PrepaidConverted AS prepaid_conv
+           PrepaidConverted AS prepaid_conv,
+           aas_equivalent.media_paid_type(
+             aas_equivalent.source_naming(UtmSource, UtmMedium, UtmCampaign)) AS media
     FROM `cdc.OrdersNew_v`
   ) o ON o.OrderID = pt.OrderID
-  WHERE pt.TransactionType=0 AND pt.Sum>0
+  -- TRY order flag, same convention as FS_STATIC (COALESCE(tbyb.id,0) > 1)
+  LEFT JOIN (SELECT DISTINCT OrderId FROM `cdc.TbybOrders_v` WHERE Id > 1) tb
+    ON tb.OrderId = pt.OrderID
+  WHERE pt.TransactionType IN (0,7) AND pt.Sum>0
     AND DATE(pt.TransactionTime)
         BETWEEN (SELECT MIN(d_start) FROM periods) AND (SELECT MAX(d_end) FROM periods)
-    AND COALESCE(s.Metadata_order_type, o.order_type, 'BUY') IN ('BUY','SUB')
+),
+-- Residual TRY guard: orders with a TRY auth attempt, by first auth date
+try_residual AS (
+  SELECT p.period, p.sort_order, COUNT(*) AS try_orders
+  FROM (
+    SELECT OrderID, MIN(DATE(TransactionTime)) AS first_date
+    FROM buy_sub_raw WHERE TransactionType = 7 GROUP BY OrderID
+  ) t
+  JOIN periods p ON t.first_date BETWEEN p.d_start AND p.d_end
+  GROUP BY p.period, p.sort_order
 ),
 buy_sub_trans AS (
   SELECT *,
@@ -201,6 +119,8 @@ buy_sub_trans AS (
       ELSE sub_type
     END AS capture_type
   FROM buy_sub_raw
+  WHERE TransactionType = 0 AND order_type IN ('BUY','SUB')
+    AND max_tt = 0 AND NOT is_try
 ),
 buy_sub_tagged AS (
   SELECT t.*, p.period, p.sort_order
@@ -211,53 +131,12 @@ buy_sub_tagged AS (
 buy_sub_order AS (
   SELECT period, sort_order, OrderID, pmt_method, order_type,
     MAX(CASE WHEN prepaid_conv THEN 1 ELSE 0 END) AS prepaid_conv,
+    ANY_VALUE(media) AS media,
     MAX(CASE WHEN pmt_method!='Credit Card' OR (succeeded OR NOT fraud_flag) THEN 1 ELSE 0 END) AS attempt,
     MAX(CASE WHEN succeeded THEN 1 ELSE 0 END) AS success
   FROM buy_sub_tagged
   WHERE capture_type='CAPTURE_FULL'
   GROUP BY period, sort_order, OrderID, pmt_method, order_type
-),
--- BUY regular = excl. prepaid-converted (payments-health signal)
-buy_reg_pivot AS (
-  SELECT period, sort_order,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 2) AS CC,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 2) AS AP,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 2) AS PP
-  FROM buy_sub_order WHERE order_type='BUY' AND prepaid_conv=0 GROUP BY period, sort_order
-),
-buy_reg_overall AS (
-  SELECT period, sort_order,
-    COUNTIF(attempt=1)                                                                    AS total_attempts,
-    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
-  FROM (
-    SELECT period, sort_order, OrderID,
-      MAX(attempt) AS attempt, MAX(success) AS success
-    FROM buy_sub_order WHERE order_type='BUY' AND prepaid_conv=0 GROUP BY period, sort_order, OrderID
-  )
-  GROUP BY period, sort_order
-),
--- Prepaid-converted pool (TRY→BUY reroute; acquisition-quality signal)
-prepaid_overall AS (
-  SELECT period, sort_order,
-    COUNTIF(attempt=1)                                                                    AS total_attempts,
-    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
-  FROM (
-    SELECT period, sort_order, OrderID,
-      MAX(attempt) AS attempt, MAX(success) AS success
-    FROM buy_sub_order WHERE order_type='BUY' AND prepaid_conv=1 GROUP BY period, sort_order, OrderID
-  )
-  GROUP BY period, sort_order
-),
--- Blended BUY overall (old view) kept for series continuity
-buy_blended_overall AS (
-  SELECT period, sort_order,
-    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
-  FROM (
-    SELECT period, sort_order, OrderID,
-      MAX(attempt) AS attempt, MAX(success) AS success
-    FROM buy_sub_order WHERE order_type='BUY' GROUP BY period, sort_order, OrderID
-  )
-  GROUP BY period, sort_order
 ),
 -- SUB: restrict to ConsecutiveChargeAttempt=1 (first billing attempt per cycle,
 --   no dunning retries). Source: Redash #1573 / subscriptions.SubscriptionsRecurringOrders_v.
@@ -266,52 +145,62 @@ sub_first_attempt AS (
   FROM `subscriptions.SubscriptionsRecurringOrders_v`
   WHERE AttemptsAmount = 1
 ),
-sub_pivot AS (
-  SELECT period, sort_order,
+-- One funnel label per order-method row; rows outside the three funnels drop out
+funnel_order AS (
+  SELECT b.*,
+    CASE
+      WHEN order_type='BUY' AND prepaid_conv=0 AND media='Paid'     THEN 'BuyPaid'
+      WHEN order_type='BUY' AND prepaid_conv=0 AND media='Non-Paid' THEN 'BuyUnpaid'
+      WHEN order_type='SUB' AND f.RecurringOrderId IS NOT NULL      THEN 'Sub'
+    END AS funnel
+  FROM buy_sub_order b
+  LEFT JOIN sub_first_attempt f ON b.OrderID = f.RecurringOrderId
+),
+funnel_pivot AS (
+  SELECT funnel, period, sort_order,
     ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Credit Card' AND success=1), COUNTIF(pmt_method='Credit Card' AND attempt=1))*100, 2) AS CC,
     ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='Apple Pay'   AND success=1), COUNTIF(pmt_method='Apple Pay'   AND attempt=1))*100, 2) AS AP,
-    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 2) AS PP
-  FROM buy_sub_order
-  JOIN sub_first_attempt ON buy_sub_order.OrderID = sub_first_attempt.RecurringOrderId
-  WHERE order_type='SUB' GROUP BY period, sort_order
+    ROUND(SAFE_DIVIDE(COUNTIF(pmt_method='PayPal'      AND success=1), COUNTIF(pmt_method='PayPal'      AND attempt=1))*100, 2) AS PP,
+    COUNTIF(pmt_method='Credit Card' AND attempt=1) AS CC_N,
+    COUNTIF(pmt_method='Apple Pay'   AND attempt=1) AS AP_N,
+    COUNTIF(pmt_method='PayPal'      AND attempt=1) AS PP_N
+  FROM funnel_order WHERE funnel IS NOT NULL GROUP BY funnel, period, sort_order
 ),
-sub_overall AS (
-  SELECT period, sort_order,
+funnel_overall AS (
+  SELECT funnel, period, sort_order,
     COUNTIF(attempt=1)                                                                    AS total_attempts,
     ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
   FROM (
-    SELECT period, sort_order, OrderID,
+    SELECT funnel, period, sort_order, OrderID,
       MAX(attempt) AS attempt, MAX(success) AS success
-    FROM buy_sub_order
-    JOIN sub_first_attempt ON buy_sub_order.OrderID = sub_first_attempt.RecurringOrderId
-    WHERE order_type='SUB' GROUP BY period, sort_order, OrderID
+    FROM funnel_order WHERE funnel IS NOT NULL GROUP BY funnel, period, sort_order, OrderID
   )
-  GROUP BY period, sort_order
-)
+  GROUP BY funnel, period, sort_order
+),
+funnel_stats AS (
+  SELECT * FROM funnel_overall LEFT JOIN funnel_pivot USING (funnel, period, sort_order)
+),
+bp AS (SELECT * FROM funnel_stats WHERE funnel='BuyPaid'),
+bu AS (SELECT * FROM funnel_stats WHERE funnel='BuyUnpaid'),
+su AS (SELECT * FROM funnel_stats WHERE funnel='Sub')
 
 -- ========== FINAL OUTPUT ==========
 SELECT
   p.period                                               AS Period,
-  tao.total_attempts AS TryAuth_Total,  tao.overall_rate AS TryAuth_Overall,
-  ta.CC  AS TryAuth_CC,  ta.AP  AS TryAuth_AP,  ta.PP  AS TryAuth_PP,
-  tso.total_attempts AS TryShip_Total,  tso.overall_rate AS TryShip_Overall,
-  ts.CC  AS TryShip_CC,  ts.AP  AS TryShip_AP,  ts.PP  AS TryShip_PP,
-  bro.total_attempts AS BuyReg_Total,   bro.overall_rate AS BuyReg_Overall,
-  br.CC  AS BuyReg_CC,   br.AP  AS BuyReg_AP,   br.PP  AS BuyReg_PP,
-  po.total_attempts  AS Prepaid_Total,  po.overall_rate  AS Prepaid_Rate,
-  ROUND(SAFE_DIVIDE(po.total_attempts, po.total_attempts + bro.total_attempts)*100, 2) AS Prepaid_Share,
-  bb.overall_rate    AS Buy_Blended_Overall,
-  so.total_attempts  AS Sub_Total,      so.overall_rate  AS Sub_Overall,
-  s.CC   AS Sub_CC,       s.AP   AS Sub_AP,       s.PP   AS Sub_PP
+  bp.total_attempts AS BuyPaid_Total,   bp.overall_rate AS BuyPaid_Overall,
+  bp.CC AS BuyPaid_CC,   bp.AP AS BuyPaid_AP,   bp.PP AS BuyPaid_PP,
+  bp.CC_N AS BuyPaid_CC_N,   bp.AP_N AS BuyPaid_AP_N,   bp.PP_N AS BuyPaid_PP_N,
+  bu.total_attempts AS BuyUnpaid_Total, bu.overall_rate AS BuyUnpaid_Overall,
+  bu.CC AS BuyUnpaid_CC, bu.AP AS BuyUnpaid_AP, bu.PP AS BuyUnpaid_PP,
+  bu.CC_N AS BuyUnpaid_CC_N, bu.AP_N AS BuyUnpaid_AP_N, bu.PP_N AS BuyUnpaid_PP_N,
+  ROUND(SAFE_DIVIDE(bp.total_attempts, bp.total_attempts + bu.total_attempts)*100, 2) AS BuyPaid_Share,
+  su.total_attempts AS Sub_Total,       su.overall_rate AS Sub_Overall,
+  su.CC AS Sub_CC,       su.AP AS Sub_AP,       su.PP AS Sub_PP,
+  su.CC_N AS Sub_CC_N,       su.AP_N AS Sub_AP_N,       su.PP_N AS Sub_PP_N,
+  IFNULL(tr.try_orders, 0)                               AS Try_Residual_Orders
 FROM periods p
-LEFT JOIN try_auth_pivot   ta  USING (period, sort_order)
-LEFT JOIN try_auth_overall tao USING (period, sort_order)
-LEFT JOIN try_ship_pivot   ts  USING (period, sort_order)
-LEFT JOIN try_ship_overall tso USING (period, sort_order)
-LEFT JOIN buy_reg_pivot     br  USING (period, sort_order)
-LEFT JOIN buy_reg_overall   bro USING (period, sort_order)
-LEFT JOIN prepaid_overall   po  USING (period, sort_order)
-LEFT JOIN buy_blended_overall bb USING (period, sort_order)
-LEFT JOIN sub_pivot          s   USING (period, sort_order)
-LEFT JOIN sub_overall        so  USING (period, sort_order)
+LEFT JOIN bp USING (period, sort_order)
+LEFT JOIN bu USING (period, sort_order)
+LEFT JOIN su USING (period, sort_order)
+LEFT JOIN try_residual tr USING (period, sort_order)
 ORDER BY p.sort_order DESC;

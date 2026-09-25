@@ -23,16 +23,26 @@ Usage:
 Expected JSON shape — a list of period rows. Each row has a ``Period`` key
 ("P4. Yesterday", "P3. Last 7d", "P2. MTD (excl yesterday)", "P1. Previous month")
 and the columns produced by the SQL:
-  TryAuth_Total / TryAuth_Overall / TryAuth_CC / TryAuth_AP / TryAuth_PP
-  TryShip_Total / TryShip_Overall / TryShip_CC / TryShip_AP / TryShip_PP
-  BuyReg_Total  / BuyReg_Overall  / BuyReg_CC  / BuyReg_AP  / BuyReg_PP
-  Prepaid_Total / Prepaid_Rate    / Prepaid_Share / Buy_Blended_Overall
-  Sub_Total     / Sub_Overall     / Sub_CC     / Sub_AP     / Sub_PP
+  BuyPaid_Total   / BuyPaid_Overall   / BuyPaid_CC   / BuyPaid_AP   / BuyPaid_PP
+  BuyUnpaid_Total / BuyUnpaid_Overall / BuyUnpaid_CC / BuyUnpaid_AP / BuyUnpaid_PP
+  Sub_Total       / Sub_Overall       / Sub_CC       / Sub_AP       / Sub_PP
+  SubAll_Total    / SubAll_Overall    / SubAll_CC    / SubAll_AP    / SubAll_PP
+  <funnel>_CC_N / <funnel>_AP_N / <funnel>_PP_N  (per-method order counts)
+  BUY only: <funnel>_<m>_Fraud / <funnel>_<m>_TotalSucc / <funnel>_<m>_AllN for
+  <m> in (Overall, CC, AP, PP), with <funnel>_AllOrders as the Overall count
+  BuyPaid_Share
 
-BUY is split: BuyReg_* excludes PrepaidConverted orders (payments-health
-signal, ~95-96% baseline); the prepaid-converted pool (TRY->BUY reroute,
-~19-27% approval, volume surges every month start) gets its own table with an
-INVERTED traffic light on its share of BUY — rising share is the warning.
+TRY was retired on 23 Aug 2026. BUY is split by acquisition source using the
+company MediaPaidType definition (paid media vs everything else). Yesterday's
+per-method cells are only traffic-lighted when they carry at least
+MIN_SCORED_ORDERS orders; smaller cells are greyed out so a single decline
+does not read as an incident.
+
+BUY tables show three Yesterday rows: card success (Forter-declined orders
+excluded), Forter fraud declines, and overall success (all orders). Only the
+overall success row is traffic-lighted, against overall success over the last
+7 days. Last 7d / MTD / Prev month show overall success too, so the Δ can be
+read straight off the table.
 """
 
 import json
@@ -59,13 +69,16 @@ PERIOD_FROM_KEY = {
     "P1. Previous month":       "Prev month",
 }
 METRICS = [("Overall", "Overall"), ("CC", "CC"), ("AP", "Apple Pay"), ("PP", "PayPal")]
+BUY_FUNNELS = {"BuyPaid", "BuyUnpaid"}
 FUNNELS = [
-    ("TryAuth", "TRY Auth",                      None),
-    ("TryShip", "TRY Shipping",                  None),
-    ("BuyReg",  "BUY — excl. prepaid-converted", None),
-    ("PREPAID", "PREPAID CONVERTED",             None),   # rendered by render_prepaid
-    ("Sub",     "SUB",                           "first attempt only"),
+    ("BuyPaid",   "BUY Paid",   "paid media"),
+    ("BuyUnpaid", "BUY Unpaid", "no paid media"),
+    ("Sub",       "SUB",        "first attempt only"),
+    ("SubAll",    "SUB Blended", "all attempts incl. retries"),
 ]
+# one column grid for every table so columns line up down the page
+COL_WIDTHS = [0.23, 0.12, 0.11, 0.13, 0.11, 0.18]
+MIN_SCORED_ORDERS = 50   # yesterday's per-method cells below this are not scored
 
 # MAËLYS brand palette (semantic traffic-light colors kept for status)
 INK            = "#120D0E"
@@ -74,7 +87,9 @@ HEADER_BG      = "#FFAFC4"
 PERIOD_BG      = "#FFE0E9"
 YEST_PERIOD_BG = "#DB6B8A"
 YEST_PERIOD_TX = "#FBFAF8"
+YEST_SUB_BG    = "#FFE0E9"   # the two extra BUY Yesterday rows
 NEUTRAL_TX     = "#5A524D"
+LOW_N_BG       = "#EBE5E2"
 GREEN_BG, YELLOW_BG, RED_BG = "#A8E0A0", "#FFE99C", "#F5C6CB"
 GREEN_TX, RED_TX            = "#1F7A1F", "#C5283D"
 
@@ -87,31 +102,22 @@ def bg_for(delta: float) -> str:
     return GREEN_BG
 
 
-def bg_for_share(delta: float) -> str:
-    """Inverted thresholds for the prepaid pool: a RISING share is the warning."""
-    if delta >= 5.0:
-        return RED_BG
-    if delta >= 2.0:
-        return YELLOW_BG
-    return GREEN_BG
+def tx_for(delta: float) -> str:
+    return RED_TX if delta < -0.5 else GREEN_TX
 
 
-def tx_for(delta: float, invert: bool = False) -> str:
-    bad = delta > 0.5 if invert else delta < -0.5
-    return RED_TX if bad else GREEN_TX
-
-
-def _style_table(tbl, n_cols: int, yest_delta_tx: str) -> None:
+def _style_table(tbl, n_cols: int, yest_delta_tx: str, yest_rows: int = 1) -> None:
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(10)
     for i in range(n_cols):
         h = tbl[(0, i)]
         h.get_text().set_color(INK)
         h.get_text().set_fontweight("bold")
-    yc = tbl[(1, 0)]
-    yc.get_text().set_color(YEST_PERIOD_TX)
-    yc.get_text().set_fontweight("bold")
-    dc = tbl[(1, n_cols - 1)]
+    for i in range(1, yest_rows + 1):
+        yc = tbl[(i, 0)]
+        yc.get_text().set_color(YEST_PERIOD_TX if i == yest_rows else INK)
+        yc.get_text().set_fontweight("bold")
+    dc = tbl[(yest_rows, n_cols - 1)]
     dc.get_text().set_color(yest_delta_tx)
     dc.get_text().set_fontweight("bold")
     for cell in tbl.get_celld().values():
@@ -127,133 +133,150 @@ def _title(ax, text: str) -> None:
             transform=ax.transAxes, clip_on=False)
 
 
+def _pct(v) -> str:
+    return "n/a" if v is None else f"{v:.1f}%"
+
+
+def _score(v, base, n) -> str:
+    """Traffic-light background for a Yesterday cell, grey when not scorable."""
+    if v is None or base is None or (n or 0) < MIN_SCORED_ORDERS:
+        return LOW_N_BG
+    return bg_for(round(v, 1) - round(base, 1))
+
+
+def _delta_cell(v, base):
+    if v is None or base is None:
+        return "", "white", 0.0
+    # computed on the 1dp values shown, so the delta can be checked against the table
+    d = round(round(v, 1) - round(base, 1), 1)
+    return f"{'+' if d >= 0 else ''}{d:.1f}pp", bg_for(d), d
+
+
 def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = None) -> None:
-    yest_total = rows["Yesterday"][f"{prefix}_Total"]
-    title = f"{short_title} - {yest_total:,} attempts yesterday"
+    is_buy = prefix in BUY_FUNNELS
+    y, l7 = rows["Yesterday"], rows["Last 7d"]
+    yest_total = (y.get(f"{prefix}_AllOrders") if is_buy else y[f"{prefix}_Total"]) or 0
+    title = f"{short_title} - {yest_total:,} orders yesterday"
     if note:
         title += f"  ({note})"
     _title(ax, title)
 
     col_labels = ["Period"] + [m[1] for m in METRICS] + ["Δ Overall vs 7d"]
     cell_text, cell_colors = [], []
-    overall_delta = rows["Yesterday"][f"{prefix}_Overall"] - rows["Last 7d"][f"{prefix}_Overall"]
 
-    for period in PERIODS:
-        r = rows[period]
-        is_yest = (period == "Yesterday")
-        row_vals = [period]
-        row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG]
+    def n_for(r, code, all_orders):
+        if code == "Overall":
+            return r.get(f"{prefix}_AllOrders") if all_orders else r[f"{prefix}_Total"]
+        return r.get(f"{prefix}_{code}_AllN" if all_orders else f"{prefix}_{code}_N")
+
+    if is_buy:
+        # Row 1: card success, row 2: Forter fraud declines (plain numbers)
+        for label, suffix in (("Yest. card success", ""), ("Yest. fraud declines", "_Fraud")):
+            cell_text.append([label] + [_pct(y.get(f"{prefix}_{c}{suffix}")) for c, _ in METRICS] + [""])
+            cell_colors.append([YEST_SUB_BG] + ["white"] * (len(METRICS) + 1))
+        # Row 3: overall success incl. Forter-blocked, scored vs the same metric last 7d
+        vals, colors = ["Yest. overall success"], [YEST_PERIOD_BG]
         for code, _ in METRICS:
-            v = r[f"{prefix}_{code}"]
-            row_vals.append(f"{v:.1f}%")
-            if is_yest:
-                d = v - rows["Last 7d"][f"{prefix}_{code}"]
-                row_colors.append(bg_for(d))
-            else:
-                row_colors.append("white")
-        if is_yest:
-            sign = "+" if overall_delta >= 0 else ""
-            row_vals.append(f"{sign}{overall_delta:.1f}pp")
-            row_colors.append(bg_for(overall_delta))
-        else:
-            row_vals.append("")
-            row_colors.append("white")
-        cell_text.append(row_vals)
-        cell_colors.append(row_colors)
+            v, base = y.get(f"{prefix}_{code}_TotalSucc"), l7.get(f"{prefix}_{code}_TotalSucc")
+            vals.append(_pct(v))
+            colors.append(_score(v, base, n_for(y, code, True)))
+        d_txt, d_bg, delta = _delta_cell(y.get(f"{prefix}_Overall_TotalSucc"),
+                                         l7.get(f"{prefix}_Overall_TotalSucc"))
+        cell_text.append(vals + [d_txt])
+        cell_colors.append(colors + [d_bg])
+        yest_rows = 3
+    else:
+        vals, colors = ["Yesterday"], [YEST_PERIOD_BG]
+        for code, _ in METRICS:
+            v, base = y[f"{prefix}_{code}"], l7[f"{prefix}_{code}"]
+            vals.append(_pct(v))
+            colors.append(_score(v, base, n_for(y, code, False)))
+        d_txt, d_bg, delta = _delta_cell(y[f"{prefix}_Overall"], l7[f"{prefix}_Overall"])
+        cell_text.append(vals + [d_txt])
+        cell_colors.append(colors + [d_bg])
+        yest_rows = 1
 
-    tbl = ax.table(
-        cellText=cell_text, colLabels=col_labels,
-        cellColours=cell_colors,
-        colColours=[HEADER_BG] * len(col_labels),
-        cellLoc="center", colLoc="center",
-        colWidths=[0.13, 0.13, 0.12, 0.15, 0.13, 0.20],
-        bbox=[0.0, 0.0, 1.0, 1.0],
-    )
-    _style_table(tbl, len(col_labels), tx_for(overall_delta))
-
-
-def render_prepaid(ax, rows: dict) -> None:
-    """Prepaid-converted pool (TRY→BUY reroute). Inverted traffic light: the
-    warning signal is a RISING share of BUY, not a falling success rate."""
-    _title(ax, f"PREPAID CONVERTED (TRY→BUY reroute) - "
-               f"{rows['Yesterday']['Prepaid_Total']:,} orders yesterday")
-
-    col_labels = ["Period", "Orders", "Share of BUY", "Success rate", "Δ Share vs 7d"]
-    share_delta = rows["Yesterday"]["Prepaid_Share"] - rows["Last 7d"]["Prepaid_Share"]
-    cell_text, cell_colors = [], []
-    for period in PERIODS:
+    # BUY history rows show overall success, the metric the coloured row is scored on
+    hist_suffix = "_TotalSucc" if is_buy else ""
+    for period in PERIODS[1:]:
         r = rows[period]
-        is_yest = (period == "Yesterday")
-        row_vals = [period, f"{r['Prepaid_Total']:,}",
-                    f"{r['Prepaid_Share']:.1f}%", f"{r['Prepaid_Rate']:.1f}%"]
-        row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG, "white",
-                      bg_for_share(share_delta) if is_yest else "white", "white"]
-        if is_yest:
-            sign = "+" if share_delta >= 0 else ""
-            row_vals.append(f"{sign}{share_delta:.1f}pp")
-            row_colors.append(bg_for_share(share_delta))
-        else:
-            row_vals.append("")
-            row_colors.append("white")
-        cell_text.append(row_vals)
-        cell_colors.append(row_colors)
+        cell_text.append([period] + [_pct(r.get(f"{prefix}_{c}{hist_suffix}")) for c, _ in METRICS] + [""])
+        cell_colors.append([PERIOD_BG] + ["white"] * (len(METRICS) + 1))
 
     tbl = ax.table(
         cellText=cell_text, colLabels=col_labels,
         cellColours=cell_colors,
         colColours=[HEADER_BG] * len(col_labels),
         cellLoc="center", colLoc="center",
-        colWidths=[0.16, 0.15, 0.19, 0.19, 0.21],
+        colWidths=COL_WIDTHS,
         bbox=[0.0, 0.0, 1.0, 1.0],
     )
-    _style_table(tbl, len(col_labels), tx_for(share_delta, invert=True))
+    _style_table(tbl, len(col_labels), tx_for(delta), yest_rows=yest_rows)
+    if is_buy:
+        for i in range(1, yest_rows + 1):
+            tbl[(i, 0)].get_text().set_fontsize(9)
 
-    blended_y = rows["Yesterday"]["Buy_Blended_Overall"]
-    blended_7 = rows["Last 7d"]["Buy_Blended_Overall"]
-    ax.text(0.5, -0.13,
-            f"Acquisition-quality signal, not payments health — volume surges every month-start. "
-            f"Blended BUY overall (old view): {blended_y:.1f}% yesterday vs {blended_7:.1f}% last 7d.",
-            ha="center", va="top", transform=ax.transAxes, fontsize=8,
-            style="italic", color=NEUTRAL_TX)
+
+def _footer_lines(rows: dict) -> list:
+    y, l7 = rows["Yesterday"], rows["Last 7d"]
+    share_y, share_7 = y.get("BuyPaid_Share"), l7.get("BuyPaid_Share")
+    lines = []
+    if share_y is not None and share_7 is not None:
+        lines.append(f"BUY mix: paid media {share_y:.1f}% of BUY orders yesterday "
+                     f"vs {share_7:.1f}% last 7d.")
+    return lines
 
 
 def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
-    fig = plt.figure(figsize=(8.5, 11.8), facecolor=PAGE_BG)
+    fig = plt.figure(figsize=(8.5, 13.0), facecolor=PAGE_BG)
     fig.text(0.5, 0.988, f"Payment Success Rates - {report_date}",
              ha="center", va="top", fontsize=20, fontweight="bold", color=INK)
 
-    y = 0.935
-    fig.text(0.20, y, "Delta vs Last 7d:", ha="left", va="center", fontsize=10, color=NEUTRAL_TX)
-    for x, bg, label in [(0.36, GREEN_BG, "stable / up"), (0.50, YELLOW_BG, "-1 to -3pp"),
-                         (0.64, RED_BG, "> -3pp drop")]:
-        fig.add_artist(mpatches.Rectangle((x, y - 0.006), 0.018, 0.012,
+    y = 0.948
+    fig.text(0.13, y, "Delta vs Last 7d:", ha="left", va="center", fontsize=10, color=NEUTRAL_TX)
+    for x, bg, label in [(0.29, GREEN_BG, "stable / up"), (0.43, YELLOW_BG, "-1 to -3pp"),
+                         (0.57, RED_BG, "> -3pp drop"),
+                         (0.71, LOW_N_BG, f"< {MIN_SCORED_ORDERS} orders")]:
+        fig.add_artist(mpatches.Rectangle((x, y - 0.008), 0.018, 0.016,
                                           facecolor=bg, edgecolor="none", transform=fig.transFigure))
         fig.text(x + 0.024, y, label, ha="left", va="center", fontsize=10, color=INK)
-    fig.text(0.20, y - 0.020,
-             "Prepaid table inverted: rising share = warning (+2pp yellow, +5pp red)",
+    fig.text(0.13, y - 0.016,
+             "BUY: Last 7d / MTD / Prev month show overall success (incl. Forter-declined orders); "
+             "only that Yesterday row is scored.",
              ha="left", va="center", fontsize=8.5, style="italic", color=NEUTRAL_TX)
 
-    gs = fig.add_gridspec(len(FUNNELS), 1, top=0.875, bottom=0.03, hspace=0.62)
+    heights = [7 if p in BUY_FUNNELS else 5 for p, _, _ in FUNNELS]
+    gs = fig.add_gridspec(len(FUNNELS), 1, top=0.895, bottom=0.06, hspace=0.45,
+                          height_ratios=heights)
     for i, (prefix, short_title, note) in enumerate(FUNNELS):
         ax = fig.add_subplot(gs[i, 0])
         ax.set_facecolor(PAGE_BG)
-        if prefix == "PREPAID":
-            render_prepaid(ax, rows)
-        else:
-            render_funnel(ax, prefix, short_title, rows, note=note)
+        render_funnel(ax, prefix, short_title, rows, note=note)
+
+    for j, line in enumerate(_footer_lines(rows)):
+        fig.text(0.5, 0.024 - j * 0.016, line, ha="center", va="center",
+                 fontsize=8.5, style="italic", color=NEUTRAL_TX)
 
     plt.savefig(out_path, dpi=170, bbox_inches="tight", facecolor=PAGE_BG)
     plt.close(fig)
 
 
+def _num(v):
+    """BQ JSON may carry numbers as strings; NULL stays None."""
+    if v is None or isinstance(v, (int, float)):
+        return v
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return v
+    return int(f) if f.is_integer() and "." not in str(v) else f
+
+
 def parse_rows(raw_rows: list) -> dict:
     out = {}
     for r in raw_rows:
+        r = {k: (v if k == "Period" else _num(v)) for k, v in r.items()}
         period = PERIOD_FROM_KEY.get(r.get("Period"), r.get("Period"))
-        # No prepaid-converted orders that period -> BQ LEFT JOIN yields NULL, not 0.
-        for key in ("Prepaid_Total", "Prepaid_Rate", "Prepaid_Share"):
-            if r.get(key) is None:
-                r[key] = 0
         out[period] = r
     missing = set(PERIODS) - set(out)
     if missing:

@@ -76,6 +76,8 @@ FUNNELS = [
     ("Sub",       "SUB",        "first attempt only"),
     ("SubAll",    "SUB Blended", "all attempts incl. retries"),
 ]
+# one column grid for every table so columns line up down the page
+COL_WIDTHS = [0.23, 0.12, 0.11, 0.13, 0.11, 0.18]
 MIN_SCORED_ORDERS = 50   # yesterday's per-method cells below this are not scored
 
 # MAËLYS brand palette (semantic traffic-light colors kept for status)
@@ -206,8 +208,7 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
         cellColours=cell_colors,
         colColours=[HEADER_BG] * len(col_labels),
         cellLoc="center", colLoc="center",
-        colWidths=[0.23, 0.12, 0.11, 0.13, 0.11, 0.18] if is_buy
-                  else [0.13, 0.13, 0.12, 0.15, 0.13, 0.20],
+        colWidths=COL_WIDTHS,
         bbox=[0.0, 0.0, 1.0, 1.0],
     )
     _style_table(tbl, len(col_labels), tx_for(delta), yest_rows=yest_rows)

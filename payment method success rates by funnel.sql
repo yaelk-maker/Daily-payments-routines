@@ -13,7 +13,7 @@
 --   BuyPaid_*   = BUY orders whose UTMs classify as paid media
 --   BuyUnpaid_* = BUY orders that did not come from paid media
 --   Sub_*       = subscription recurring charges, first billing attempt only
---   Try_Residual_Orders = orders with a TRY auth attempt (guard: expected ~0)
+--   *_BankDecl / *_ForterDecl / *_AllOrders = BUY decline split (see below)
 --
 -- Paid / Unpaid split — company definition, identical to
 -- aas_equivalent.FS_STATIC.MediaPaidType / Orders_s.MediaPaidType / Live Report v2:
@@ -30,10 +30,20 @@
 --   - BUY = everything else (COALESCE fallback='BUY')
 --   - TRY orders (cdc.TbybOrders_v, or any TRY auth TransactionType=7 in the
 --     window) are excluded from BUY/SUB, so TRY shipping / post-trial charges
---     without Spreedly metadata (PayPal) cannot fall through the 'BUY' fallback
+--     without Spreedly metadata (PayPal) cannot fall through the 'BUY' fallback.
+--     Remaining TRY checkouts (old carts saved in customers' browsers) are
+--     immaterial and not reported.
 --   - PrepaidConverted orders (TRY->BUY reroute, ~20% approval) excluded from
 --     BUY; the flow ended with TRY and is no longer reported
---   - CC fraud-blocked excluded from denominator
+--   - CC fraud-blocked excluded from denominator of the success rates
+--   - Decline split (BUY only; SUB is merchant-initiated, no Forter screening):
+--       ForterDecl = order never succeeded and at least one attempt was blocked by
+--                    Forter pre-auth (Spreedly Message LIKE '%fraud%': "gateway
+--                    transaction not attempted due to failed pre authorization
+--                    fraud check.")
+--       BankDecl   = order never succeeded, no Forter block (issuer / PSP decline)
+--       AllOrders  = every order in the funnel incl. Forter-blocked (the base for
+--                    decline shares; so BankDecl share is not exactly 100 - Overall)
 --   - SUB restricted to first billing attempt per cycle (AttemptsAmount=1)
 --   - NOTE: SUB rate = same-day billing success; remaining orders enter dunning
 --     and may succeed on subsequent days. Use for anomaly detection, not final rates.
@@ -90,16 +100,6 @@ buy_sub_raw AS (
     AND DATE(pt.TransactionTime)
         BETWEEN (SELECT MIN(d_start) FROM periods) AND (SELECT MAX(d_end) FROM periods)
 ),
--- Residual TRY guard: orders with a TRY auth attempt, by first auth date
-try_residual AS (
-  SELECT p.period, p.sort_order, COUNT(*) AS try_orders
-  FROM (
-    SELECT OrderID, MIN(DATE(TransactionTime)) AS first_date
-    FROM buy_sub_raw WHERE TransactionType = 7 GROUP BY OrderID
-  ) t
-  JOIN periods p ON t.first_date BETWEEN p.d_start AND p.d_end
-  GROUP BY p.period, p.sort_order
-),
 buy_sub_trans AS (
   SELECT *,
     MIN(DATE(TransactionTime)) OVER (PARTITION BY OrderID) AS first_date,
@@ -133,7 +133,8 @@ buy_sub_order AS (
     MAX(CASE WHEN prepaid_conv THEN 1 ELSE 0 END) AS prepaid_conv,
     ANY_VALUE(media) AS media,
     MAX(CASE WHEN pmt_method!='Credit Card' OR (succeeded OR NOT fraud_flag) THEN 1 ELSE 0 END) AS attempt,
-    MAX(CASE WHEN succeeded THEN 1 ELSE 0 END) AS success
+    MAX(CASE WHEN succeeded THEN 1 ELSE 0 END) AS success,
+    MAX(CASE WHEN fraud_flag THEN 1 ELSE 0 END) AS forter_block
   FROM buy_sub_tagged
   WHERE capture_type='CAPTURE_FULL'
   GROUP BY period, sort_order, OrderID, pmt_method, order_type
@@ -169,10 +170,13 @@ funnel_pivot AS (
 funnel_overall AS (
   SELECT funnel, period, sort_order,
     COUNTIF(attempt=1)                                                                    AS total_attempts,
-    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate
+    ROUND(SAFE_DIVIDE(COUNTIF(attempt=1 AND success=1), COUNTIF(attempt=1))*100, 2) AS overall_rate,
+    COUNT(*)                                     AS all_orders,
+    COUNTIF(success=0 AND forter_block=0)        AS bank_declined,
+    COUNTIF(success=0 AND forter_block=1)        AS forter_declined
   FROM (
     SELECT funnel, period, sort_order, OrderID,
-      MAX(attempt) AS attempt, MAX(success) AS success
+      MAX(attempt) AS attempt, MAX(success) AS success, MAX(forter_block) AS forter_block
     FROM funnel_order WHERE funnel IS NOT NULL GROUP BY funnel, period, sort_order, OrderID
   )
   GROUP BY funnel, period, sort_order
@@ -190,17 +194,17 @@ SELECT
   bp.total_attempts AS BuyPaid_Total,   bp.overall_rate AS BuyPaid_Overall,
   bp.CC AS BuyPaid_CC,   bp.AP AS BuyPaid_AP,   bp.PP AS BuyPaid_PP,
   bp.CC_N AS BuyPaid_CC_N,   bp.AP_N AS BuyPaid_AP_N,   bp.PP_N AS BuyPaid_PP_N,
+  bp.all_orders AS BuyPaid_AllOrders, bp.bank_declined AS BuyPaid_BankDecl, bp.forter_declined AS BuyPaid_ForterDecl,
   bu.total_attempts AS BuyUnpaid_Total, bu.overall_rate AS BuyUnpaid_Overall,
   bu.CC AS BuyUnpaid_CC, bu.AP AS BuyUnpaid_AP, bu.PP AS BuyUnpaid_PP,
   bu.CC_N AS BuyUnpaid_CC_N, bu.AP_N AS BuyUnpaid_AP_N, bu.PP_N AS BuyUnpaid_PP_N,
+  bu.all_orders AS BuyUnpaid_AllOrders, bu.bank_declined AS BuyUnpaid_BankDecl, bu.forter_declined AS BuyUnpaid_ForterDecl,
   ROUND(SAFE_DIVIDE(bp.total_attempts, bp.total_attempts + bu.total_attempts)*100, 2) AS BuyPaid_Share,
   su.total_attempts AS Sub_Total,       su.overall_rate AS Sub_Overall,
   su.CC AS Sub_CC,       su.AP AS Sub_AP,       su.PP AS Sub_PP,
-  su.CC_N AS Sub_CC_N,       su.AP_N AS Sub_AP_N,       su.PP_N AS Sub_PP_N,
-  IFNULL(tr.try_orders, 0)                               AS Try_Residual_Orders
+  su.CC_N AS Sub_CC_N,       su.AP_N AS Sub_AP_N,       su.PP_N AS Sub_PP_N
 FROM periods p
 LEFT JOIN bp USING (period, sort_order)
 LEFT JOIN bu USING (period, sort_order)
 LEFT JOIN su USING (period, sort_order)
-LEFT JOIN try_residual tr USING (period, sort_order)
 ORDER BY p.sort_order DESC;

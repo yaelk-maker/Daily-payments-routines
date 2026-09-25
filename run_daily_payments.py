@@ -27,13 +27,17 @@ and the columns produced by the SQL:
   BuyUnpaid_Total / BuyUnpaid_Overall / BuyUnpaid_CC / BuyUnpaid_AP / BuyUnpaid_PP
   Sub_Total       / Sub_Overall       / Sub_CC       / Sub_AP       / Sub_PP
   <funnel>_CC_N / <funnel>_AP_N / <funnel>_PP_N  (per-method order counts)
-  BuyPaid_Share / Try_Residual_Orders
+  BuyPaid_AllOrders   / BuyPaid_BankDecl   / BuyPaid_ForterDecl
+  BuyUnpaid_AllOrders / BuyUnpaid_BankDecl / BuyUnpaid_ForterDecl
+  BuyPaid_Share
 
 TRY was retired on 23 Aug 2026. BUY is split by acquisition source using the
 company MediaPaidType definition (paid media vs everything else). Yesterday's
 per-method cells are only traffic-lighted when they carry at least
 MIN_SCORED_ORDERS orders; smaller cells are greyed out so a single decline
-does not read as an incident.
+does not read as an incident. The BUY DECLINES table splits declined orders
+into bank / PSP declines and Forter fraud blocks, with an INVERTED traffic
+light (a rising decline share is the warning).
 """
 
 import json
@@ -63,6 +67,7 @@ METRICS = [("Overall", "Overall"), ("CC", "CC"), ("AP", "Apple Pay"), ("PP", "Pa
 FUNNELS = [
     ("BuyPaid",   "BUY Paid",   "paid media"),
     ("BuyUnpaid", "BUY Unpaid", "no paid media"),
+    ("DECLINES",  "BUY DECLINES", None),   # rendered by render_declines
     ("Sub",       "SUB",        "first attempt only"),
 ]
 MIN_SCORED_ORDERS = 50   # yesterday's per-method cells below this are not scored
@@ -86,6 +91,11 @@ def bg_for(delta: float) -> str:
     if delta <= -1.0:
         return YELLOW_BG
     return GREEN_BG
+
+
+def bg_for_decline(delta: float) -> str:
+    """Inverted thresholds for decline shares: a RISING share is the warning."""
+    return bg_for(-delta)
 
 
 def tx_for(delta: float) -> str:
@@ -174,6 +184,71 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
     _style_table(tbl, len(col_labels), tx_for(overall_delta or 0.0))
 
 
+def _decline_share(r: dict, prefix: str, kind: str):
+    n = r.get(f"{prefix}_{kind}Decl")
+    base = r.get(f"{prefix}_AllOrders")
+    if n is None or not base:
+        return n, None
+    return n, 100.0 * n / base
+
+
+def render_declines(ax, rows: dict) -> None:
+    """BUY declines split by who declined: the bank / PSP, or Forter's
+    pre-auth fraud check. Shares are of all BUY orders incl. Forter-blocked."""
+    y = rows["Yesterday"]
+    total_y = sum((y.get(f"{p}_BankDecl") or 0) + (y.get(f"{p}_ForterDecl") or 0)
+                  for p in ("BuyPaid", "BuyUnpaid"))
+    _title(ax, f"BUY DECLINES - {total_y:,} declined orders yesterday")
+
+    cols = [("BuyPaid", "Bank"), ("BuyPaid", "Forter"),
+            ("BuyUnpaid", "Bank"), ("BuyUnpaid", "Forter")]
+    col_labels = ["Period", "Paid: Bank", "Paid: Forter", "Unpaid: Bank", "Unpaid: Forter"]
+    cell_text, cell_colors = [], []
+    for period in PERIODS:
+        r = rows[period]
+        is_yest = (period == "Yesterday")
+        row_vals = [period]
+        row_colors = [YEST_PERIOD_BG if is_yest else PERIOD_BG]
+        for prefix, kind in cols:
+            n, share = _decline_share(r, prefix, kind)
+            row_vals.append("n/a" if share is None else f"{n:,} ({share:.1f}%)")
+            if not is_yest:
+                row_colors.append("white")
+                continue
+            _, base = _decline_share(rows["Last 7d"], prefix, kind)
+            if share is None or base is None or (r.get(f"{prefix}_AllOrders") or 0) < MIN_SCORED_ORDERS:
+                row_colors.append(LOW_N_BG)
+            else:
+                row_colors.append(bg_for_decline(share - base))
+        cell_text.append(row_vals)
+        cell_colors.append(row_colors)
+
+    tbl = ax.table(
+        cellText=cell_text, colLabels=col_labels,
+        cellColours=cell_colors,
+        colColours=[HEADER_BG] * len(col_labels),
+        cellLoc="center", colLoc="center",
+        colWidths=[0.16, 0.21, 0.21, 0.21, 0.21],
+        bbox=[0.0, 0.0, 1.0, 1.0],
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    for i in range(len(col_labels)):
+        tbl[(0, i)].get_text().set_color(INK)
+        tbl[(0, i)].get_text().set_fontweight("bold")
+    tbl[(1, 0)].get_text().set_color(YEST_PERIOD_TX)
+    tbl[(1, 0)].get_text().set_fontweight("bold")
+    for cell in tbl.get_celld().values():
+        cell.set_edgecolor(PAGE_BG)
+        cell.set_linewidth(1.5)
+
+    ax.text(0.5, -0.13,
+            "Orders (share of all BUY orders in the segment). Bank = issuer / PSP decline. "
+            "Forter = pre-auth fraud block. SUB is not Forter-screened.",
+            ha="center", va="top", transform=ax.transAxes, fontsize=8,
+            style="italic", color=NEUTRAL_TX)
+
+
 def _footer_lines(rows: dict) -> list:
     y, l7 = rows["Yesterday"], rows["Last 7d"]
     share_y, share_7 = y.get("BuyPaid_Share"), l7.get("BuyPaid_Share")
@@ -181,19 +256,15 @@ def _footer_lines(rows: dict) -> list:
     if share_y is not None and share_7 is not None:
         lines.append(f"BUY mix: paid media {share_y:.1f}% of BUY orders yesterday "
                      f"vs {share_7:.1f}% last 7d.")
-    try_y = y.get("Try_Residual_Orders") or 0
-    try_7 = (l7.get("Try_Residual_Orders") or 0) / 7
-    lines.append(f"Residual TRY checkouts (TRY closed 23 Aug, excluded from all tables): "
-                 f"{try_y:,} yesterday vs {try_7:.0f}/day last 7d.")
     return lines
 
 
 def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
-    fig = plt.figure(figsize=(8.5, 8.6), facecolor=PAGE_BG)
+    fig = plt.figure(figsize=(8.5, 11.4), facecolor=PAGE_BG)
     fig.text(0.5, 0.988, f"Payment Success Rates - {report_date}",
              ha="center", va="top", fontsize=20, fontweight="bold", color=INK)
 
-    y = 0.915
+    y = 0.935
     fig.text(0.13, y, "Delta vs Last 7d:", ha="left", va="center", fontsize=10, color=NEUTRAL_TX)
     for x, bg, label in [(0.29, GREEN_BG, "stable / up"), (0.43, YELLOW_BG, "-1 to -3pp"),
                          (0.57, RED_BG, "> -3pp drop"),
@@ -201,15 +272,21 @@ def generate_image(rows: dict, report_date: str, out_path: Path) -> None:
         fig.add_artist(mpatches.Rectangle((x, y - 0.008), 0.018, 0.016,
                                           facecolor=bg, edgecolor="none", transform=fig.transFigure))
         fig.text(x + 0.024, y, label, ha="left", va="center", fontsize=10, color=INK)
+    fig.text(0.13, y - 0.020,
+             "Declines table inverted: a rising decline share is the warning (+1pp yellow, +3pp red)",
+             ha="left", va="center", fontsize=8.5, style="italic", color=NEUTRAL_TX)
 
-    gs = fig.add_gridspec(len(FUNNELS), 1, top=0.835, bottom=0.10, hspace=0.62)
+    gs = fig.add_gridspec(len(FUNNELS), 1, top=0.875, bottom=0.07, hspace=0.62)
     for i, (prefix, short_title, note) in enumerate(FUNNELS):
         ax = fig.add_subplot(gs[i, 0])
         ax.set_facecolor(PAGE_BG)
-        render_funnel(ax, prefix, short_title, rows, note=note)
+        if prefix == "DECLINES":
+            render_declines(ax, rows)
+        else:
+            render_funnel(ax, prefix, short_title, rows, note=note)
 
     for j, line in enumerate(_footer_lines(rows)):
-        fig.text(0.5, 0.045 - j * 0.024, line, ha="center", va="center",
+        fig.text(0.5, 0.030 - j * 0.020, line, ha="center", va="center",
                  fontsize=8.5, style="italic", color=NEUTRAL_TX)
 
     plt.savefig(out_path, dpi=170, bbox_inches="tight", facecolor=PAGE_BG)

@@ -1,109 +1,97 @@
 # Daily-payments-routines
 
-Daily monitoring of payment success rates for the live funnels (BUY Paid, BUY Unpaid, SUB first attempt, SUB blended) by payment method, posted as a single PNG to `#payments-daily-monitoring`.
+**Payments Daily**: a single PNG posted every morning to `#payments-daily-monitoring`. It shows yesterday's payment success for BUY Paid, BUY Unpaid and SUB (US only), each compared with its normal over the previous 28 days. It is built to stay quiet on normal days and name the problem on bad ones.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `payment method success rates by funnel.sql` | **Routine query.** Returns 4 periods × 4 funnels (`BuyPaid`, `BuyUnpaid`, `Sub`, `SubAll`) × (`Total`, `Overall`, `CC`, `AP`, `PP`, `AF`, plus per-method order counts `CC_N`/`AP_N`/`PP_N`/`AF_N`), for BUY the Forter split per column (`<m>_Fraud`, `<m>_TotalSucc`, `<m>_AllN`, `AllOrders`) and `BuyPaid_Share`. |
-| `run_daily_payments.py` | Reads the BQ result JSON, renders the daily PNG, commits + pushes it to the current branch, and posts the Slack `image` block. |
-| `payments.png` | Latest rendered image; referenced by Slack via `raw.githubusercontent.com`. |
-| `archive/try funnel daily monitoring.sql` | Retired TRY deep-dive (AO vs AM auth, fraud vs payment-fail shipping). Kept for reference only; TRY stopped selling on 23 Aug 2026. |
+| `payment method success rates by funnel.sql` | **Routine query.** Returns long-format order counts: one row per (`period`, `segment`, `dim`) with `n` and `k`, for yesterday (`Y`) and the previous 28 days (`B28`). No rates are rounded in SQL. |
+| `run_daily_payments.py` | Reads the query result, scores yesterday against normal, renders `payments.png`, commits + pushes it, and posts the Slack `image` block. `--render-only [out.png]` renders without git or Slack. |
+| `payments.png` | Latest rendered image; Slack loads it from `raw.githubusercontent.com`. |
+| `archive/try funnel daily monitoring.sql` | Retired TRY deep-dive, kept for reference (TRY stopped selling on 23 Aug 2026). |
 
-## What changed in September 2026
+## What the image shows
 
-MAËLYS stopped selling through TRY on 23 Aug 2026. After that date TRY fell from ~600 to 2,300 orders/day to single or low double digits, and the prepaid-converted pool (the TRY→BUY reroute) fell to 0 to 8 orders/day. So the TRY Auth, TRY Shipping and Prepaid Converted tables no longer carried a usable signal. The routine now tracks the current key metrics:
-
-| Funnel | Population |
+| Section | Content |
 |---|---|
-| **BUY Paid** | BUY orders whose UTMs classify as paid media |
-| **BUY Unpaid** | BUY orders that did not come from paid media (organic / direct, CRM, unpaid search, other) |
-| **SUB** | Subscription recurring charges, first billing attempt only (unchanged) |
-| **SUB Blended** | Every SUB order processed: first attempts plus dunning retries (attempts 2 to 6 of each cycle) |
+| **Banner** | "All normal" in green, or one line per unusual cell (amber) or very unusual cell (red, listed first) |
+| **Headline tiles** | BUY Paid, BUY Unpaid, SUB first attempt: yesterday's success rate, its normal, the change in pp, and `attempts · completed` |
+| **BUY approval by payment method** | Paid and Unpaid × Card, Apple Pay, PayPal, AfterPay, plus Forter blocks. Each cell shows yesterday, its normal and yesterday's order count |
+| **SUB first attempt by recurring order** | 1st recurring order, 2nd to 3rd, 4th+ |
 
-## Methodology
+Removed from the daily image by design: Last 7d / MTD / Prev month rows, SUB Blended (retries), and the per-processor view. Trend and retry recovery belong in a weekly review, and processor outages in an hourly alert.
 
-**Paid vs Unpaid** uses the company definition: the same one behind `aas_equivalent.FS_STATIC.MediaPaidType`, `Orders_s.MediaPaidType` and the Live Report v2 `media_paid_type` filter:
+## Definitions
 
-```
-aas_equivalent.media_paid_type(aas_equivalent.source_naming(UtmSource, UtmMedium, UtmCampaign))
-```
-
-| Class | `source_naming` channels |
+| Term | Definition |
 |---|---|
-| Non-Paid (Unpaid) | Organic / Direct, CRM, Search (Google with no paid markers), Other |
-| Paid | Facebook, YouTube, Applovin, Snapchat, TikTok, Bing, PaidSearch, Affiliate, and any new channel (Unpaid is a whitelist) |
+| Attempts | Orders with at least one charge attempt, each order counted once, dated by its first transaction (Israel date) |
+| Completed | Attempted orders approved on any payment method. This is the number that compares with the sales reports' paid-order counts |
+| Success rate | Completed ÷ attempts (Forter-declined orders included) |
+| BUY Paid | The order's UTMs classify as paid media, **or** the customer is new (no paid order before this one). This is the Analysis report's rule, applied to declined attempts too |
+| BUY Unpaid | A returning customer whose order did not come from paid media |
+| Paid media | `aas_equivalent.media_paid_type(source_naming(UtmSource, UtmMedium, UtmCampaign))`, the company definition behind `FS_STATIC.MediaPaidType` |
+| SUB first attempt | Attempt 1 of billing cycle 1: the regular monthly charge. Retries (attempts 2 to 6) and restarts after a failed month are excluded |
+| Forter blocks | Orders that never succeeded and had at least one attempt blocked by Forter's pre-auth check (Spreedly message "gateway transaction not attempted due to failed pre authorization fraud check.") |
+| Normal | The same metric over the 28 days before yesterday |
+| Expected (SUB) | Σ yesterday's orders per recurring-order group × that group's 28-day rate, ÷ yesterday's orders. It adjusts for mix: 1st recurring orders approve at ~57%, 4th+ at ~82% |
 
-The functions are applied to the order's own UTMs in `cdc.OrdersNew_v`, not to `FS_STATIC`, because `FS_STATIC` only holds paid orders and a success rate needs the failed ones too. Attribution is the order's last-touch UTM, not the customer's first-touch source.
+## Scoring
 
-**BUY / SUB** follow Redash #1613 (BUY Success Rate Timeline):
-- `TransactionType=0` / `CAPTURE_FULL`; `SUB = SitePart IN (10,12)` or Spreedly `Metadata_order_type='SUB'`; everything else is BUY
-- Payment methods: Credit Card (CC, real cards only), Apple Pay (AP), PayPal (PP), AfterPay (AF). AfterPay does not route through Spreedly, so it has no Spreedly record and no Forter pre-auth flag; its outcome comes from `cdc.PaymentTransactions_v.IsSuccessful` (checked: 0 AfterPay orders marked successful but unpaid in 28 days). Before 26 Sep 2026 AfterPay fell into the CC column (~30% of it). SUB has no AfterPay orders, so that column is blank in the SUB tables.
-- CC fraud-blocked orders excluded from the success-rate denominator
-- TRY orders are excluded from BUY and SUB: any order in `cdc.TbybOrders_v`, or with a TRY auth (`TransactionType=7`) in the window. Without this, TRY shipping and post-trial charges that have no Spreedly metadata (PayPal) fell through the `'BUY'` fallback. The TRY checkouts still coming in are customers completing old carts saved in their browser; they are immaterial and not reported.
-- `OrdersNew_v.PrepaidConverted` orders are still excluded from BUY (the flow ended with TRY; ~20% approval would add noise)
-- SUB is restricted to **attempt 1 of billing cycle 1**. When a cycle fails all 6 attempts, the next month restarts at `AttemptsAmount = 1` with the **same** `RecurringNumber`, so `AttemptsAmount = 1` alone also picked up cycle 2 and 3 restarts (~18% of attempt-1 orders, 2 to 5% approval). Cycle 1 = the first `AttemptsAmount = 1` order for a (`SubscriptionId`, `RecurringNumber`), over full history. Restarts stay in SUB Blended. Changed on 26 Sep 2026: on 24 Sep this moved SUB from 1,029 orders at 58.9% to 812 at 73.9%.
-- `subscriptions.SubscriptionsRecurringOrders_v` carries duplicate rows (~37% of `RecurringOrderId`s); the query deduplicates before use.
-- SUB Blended takes every SUB order. Each retry is its own recurring order ID charged on a single day, so each order counts once on its processing date. The blended rate sits far below the first-attempt rate: on 24 Sep, 812 cycle-1 first attempts approved at 73.9% and 2,425 retries and restarts at ~3.8%, so 3,237 orders were approved at 21.4%. It moves with the retry mix as well as with payments health.
+A cell is coloured only when a move that bad would be unlikely by chance at yesterday's volume. It uses an exact one-sided binomial test against normal (expected for the SUB tile):
 
-Common across all funnels:
-- Source: `cdc.PaymentTransactions_v` `LEFT JOIN spreedly.transaction_report_v` on `OrchestratorToken`
-- `sum > 0` filter (zero-amount transactions excluded)
-- Period attribution: order's first `DATE(TransactionTime)` (matching Redash, no timezone conversion)
-- Order-level dedup (`MAX` over flags); `Overall` and `Total` columns dedup orders once across payment methods
-- Rates rounded to 2 decimal places; the image renders them at 1dp
+| Colour | Chance of noise | Equivalent |
+|---|---|---|
+| White | ≥ 2.3% | within normal range |
+| Amber | < 2.3% | about 2 standard deviations |
+| Red | < 0.13% | about 3 standard deviations |
 
-**BUY Yesterday rows** (order level, BUY only). Each BUY table shows three Yesterday rows:
+Forter blocks are tested the other way: a rise is the warning. A method with no orders yesterday shows "no orders". Fixed pp thresholds were dropped because at 40 to 300 orders a day they coloured noise: about 2 to 3 red cells a day by chance under the old ±3pp rule.
 
-| Row | Definition |
-|---|---|
-| Yest. card success | Approved / orders that were **not** Forter-declined |
-| Yest. fraud declines | Forter-declined orders / **all** orders. Forter-declined = the order never succeeded and at least one attempt was blocked by Forter's pre-auth fraud check (Spreedly `Message` contains `fraud`: "gateway transaction not attempted due to failed pre authorization fraud check.") |
-| Yest. overall success | Approved / **all** orders, including Forter-declined. This is the metric in the Last 7d / MTD / Prev month rows. |
+## Methodology details
 
-The three reconcile: overall success = card success × (1 − fraud declines). Forter blocks are almost all credit card: from 26 Aug to 24 Sep there was 1 Apple Pay block and 0 PayPal, so Apple Pay and PayPal normally show 0.0% fraud declines. SUB is merchant-initiated and not Forter-screened.
+- **Source:** `cdc.PaymentTransactions_v` `LEFT JOIN spreedly.transaction_report_v` on `OrchestratorToken`; `TransactionType = 0`, `CAPTURE_FULL`, `Sum > 0`. Aligned with Redash #1613.
+- **US only:** `cdc.OrdersNew_v.Country = 'United States of America'`. Non-US was 0.4% of BUY Paid, 3.9% of BUY Unpaid and 0.2% of SUB in Sep 2026.
+- **Payment methods:** Card (real cards only), Apple Pay, PayPal, AfterPay.
+  - AfterPay does not route through Spreedly, so it has no Spreedly record. Its outcome comes from `IsSuccessful`: 0 AfterPay orders were marked successful but unpaid in 28 days.
+  - AfterPay has no Forter pre-auth flag.
+  - Until 26 Sep 2026, AfterPay was counted inside Card (~30% of that column).
+- **New customer:** the user has no paid order (`Status` 1/3, or 11/12 as `FS_STATIC` treats them) created before this order.
+- **Excluded:**
+  - TRY orders (`cdc.TbybOrders_v`, or any TRY auth in the window). The remaining TRY checkouts are old carts saved in customers' browsers.
+  - PrepaidConverted orders.
+- **SUB cycles:** a cycle that fails all 6 attempts restarts next month at `AttemptsAmount = 1` with the **same** `RecurringNumber`. Cycle 1 is therefore the first `AttemptsAmount = 1` order per (`SubscriptionId`, `RecurringNumber`), over full history.
+  - `SubscriptionsRecurringOrders_v` has duplicate rows (~37% of ids) and is deduplicated.
+  - SUB success is same-day billing success; failed orders enter dunning.
 
-Change in Sep 2026: card success used to drop an order from the denominator only when **every** attempt on it was Forter-blocked. It now drops every Forter-declined order, so the three rows reconcile. On 24 Sep data this moved the historical BUY rates by +0.03 to +0.10pp (e.g. BUY Paid last 7d 96.37% → 96.43%).
+## Reconciliation with the Analysis report (24 Sep 2026, US)
 
-**Note on SUB:** the rate reflects same-day billing success. Orders that fail same-day enter dunning and may succeed on subsequent days, so the SUB rate here is a leading indicator for anomaly detection, not a final renewal rate.
+| | Report Paid Media | Report Non-Paid |
+|---|---|---|
+| Completed here, same segment | 301 | 170 |
+| Completed here as Paid, report Non-Paid (new-customer timing) | | 2 |
+| Paid on 24 Sep after a decline on an earlier day (dated by first attempt here) | 2 | |
+| Charged orders whose only item is a free gift (SitePart 12: SUB in payments data, BUY in the report) | | 15 |
+| TRY order (excluded here) | | 1 |
+| **Report total** | **303** | **188** |
+
+Declined orders appear only here: 15 Paid, 5 Unpaid.
 
 ## Daily routine
 
-Runs as the Claude Code Remote Routine **"Payments success rate monitoring"** (daily 04:30 UTC). The routine prompt references only the two file names, so it needs no change. Each run:
+Runs as the Claude Code Remote Routine **"Payments success rate monitoring"** (daily 04:30 UTC). The routine prompt references only the two file names. Each run:
 
-1. Execute `payment method success rates by funnel.sql` via the BigQuery MCP (project `maelys-data`) and capture the 4 rows as JSON, for example saved to `/tmp/bq_results.json`.
-2. Run `python run_daily_payments.py /tmp/bq_results.json` (or `... -` for stdin). The script:
-   - Renders `payments.png` (page title, color legend, BUY Paid / BUY Unpaid / SUB / SUB Blended tables with traffic-light highlighting on the Yesterday row, and a footer line).
-   - Commits and pushes `payments.png` to the current branch.
-   - Posts a Slack `image` block to `#payments-daily-monitoring` referencing `https://raw.githubusercontent.com/yaelk-maker/Daily-payments-routines/<branch>/payments.png?v=<ts>`.
-
-### Required environment
+1. Execute `payment method success rates by funnel.sql` via the BigQuery MCP (project `maelys-data`) and save the rows as JSON, e.g. `/tmp/bq_results.json`.
+2. Run `python run_daily_payments.py /tmp/bq_results.json`. It renders `payments.png`, commits and pushes it, and posts a Slack `image` block referencing `https://raw.githubusercontent.com/yaelk-maker/Daily-payments-routines/<branch>/payments.png?v=<ts>`.
 
 | Variable | Purpose |
 |---|---|
 | `SLACK_BOT_TOKEN` | Slack bot token with `chat:write` |
 | `SLACK_CHANNEL_PAYMENTS` | Channel ID for `#payments-daily-monitoring` |
 
-### Why GitHub-hosted images
+Slack `image` blocks need a public HTTPS URL, and the routine sandbox cannot reach `files.slack.com`. That is why the image is committed and served from `raw.githubusercontent.com`.
 
-Slack `image` blocks require a publicly fetchable HTTPS URL. The Claude Code Remote Routine sandbox cannot reach `files.slack.com` (no `files.upload`), so the image is committed to the repo and Slack fetches it from `raw.githubusercontent.com`, which is publicly cached and reliable.
-
-## Slack message format
-
-A single PNG with:
-- **Page title:** `Payment Success Rates - YYYY-MM-DD`
-- **Legend:** `Delta vs Last 7d:` followed by colored swatches: `stable / up`, `-1 to -3pp`, `> -3pp drop`, `< 50 orders`
-- **One table per funnel** (BUY Paid, BUY Unpaid, SUB, SUB Blended at the bottom) with rows `Yesterday | Last 7d | MTD | Prev month` and columns `Period | Overall | CC | Apple Pay | PayPal | AfterPay | Δ Overall vs 7d`
-- **BUY tables** have three Yesterday rows (`Yest. card success`, `Yest. fraud declines`, `Yest. overall success`) above `Last 7d | MTD | Prev month`
-- **Footer:** paid media share of BUY orders (yesterday vs last 7d)
-
-Thresholds (Yesterday vs Last 7d):
-- 🟥 cell: drop > 3pp
-- 🟨 cell: drop 1 to 3pp
-- 🟩 cell: stable / up
-- ⬜ grey cell: fewer than 50 orders yesterday for that payment method, not scored (one decline in 50 is 2pp; splitting BUY in two leaves PayPal and Apple Pay at ~35 to 60 orders a day)
-- Δ text: red when < −0.5pp, green otherwise
-- Δ and colours are computed from the 1dp values shown, so they can be checked against the table
-
-BUY tables: only the `Yest. overall success` row is coloured. Its Δ is yesterday's overall success minus the Last 7d row shown directly below it (both include Forter-declined orders). The card success and fraud decline rows are plain numbers. SUB tables are unchanged: all rows show the SUB success rate.
+## Open items
+- About 15 charged orders a day on SitePart 12 whose only item is a free gift: are they SUB or BUY? To confirm with the data team.
+- `OrderDetails_v.FraudCheckStatus` (0/1/2) tracks payment outcome, not Forter's decision. Its meaning should be confirmed before any use.

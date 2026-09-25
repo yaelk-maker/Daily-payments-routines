@@ -6,7 +6,7 @@ Daily monitoring of payment success rates for the live funnels (BUY Paid, BUY Un
 
 | File | Purpose |
 |---|---|
-| `payment method success rates by funnel.sql` | **Routine query.** Returns 4 periods × 4 funnels (`BuyPaid`, `BuyUnpaid`, `Sub`, `SubAll`) × (`Total`, `Overall`, `CC`, `AP`, `PP`, plus per-method order counts `CC_N`/`AP_N`/`PP_N`), for BUY the Forter split per column (`<m>_Fraud`, `<m>_TotalSucc`, `<m>_AllN`, `AllOrders`) and `BuyPaid_Share`. |
+| `payment method success rates by funnel.sql` | **Routine query.** Returns 4 periods × 4 funnels (`BuyPaid`, `BuyUnpaid`, `Sub`, `SubAll`) × (`Total`, `Overall`, `CC`, `AP`, `PP`, `AF`, plus per-method order counts `CC_N`/`AP_N`/`PP_N`/`AF_N`), for BUY the Forter split per column (`<m>_Fraud`, `<m>_TotalSucc`, `<m>_AllN`, `AllOrders`) and `BuyPaid_Share`. |
 | `run_daily_payments.py` | Reads the BQ result JSON, renders the daily PNG, commits + pushes it to the current branch, and posts the Slack `image` block. |
 | `payments.png` | Latest rendered image; referenced by Slack via `raw.githubusercontent.com`. |
 | `archive/try funnel daily monitoring.sql` | Retired TRY deep-dive (AO vs AM auth, fraud vs payment-fail shipping). Kept for reference only; TRY stopped selling on 23 Aug 2026. |
@@ -39,11 +39,13 @@ The functions are applied to the order's own UTMs in `cdc.OrdersNew_v`, not to `
 
 **BUY / SUB** follow Redash #1613 (BUY Success Rate Timeline):
 - `TransactionType=0` / `CAPTURE_FULL`; `SUB = SitePart IN (10,12)` or Spreedly `Metadata_order_type='SUB'`; everything else is BUY
+- Payment methods: Credit Card (CC, real cards only), Apple Pay (AP), PayPal (PP), AfterPay (AF). AfterPay does not route through Spreedly, so it has no Spreedly record and no Forter pre-auth flag; its outcome comes from `cdc.PaymentTransactions_v.IsSuccessful` (checked: 0 AfterPay orders marked successful but unpaid in 28 days). Before 26 Sep 2026 AfterPay fell into the CC column (~30% of it). SUB has no AfterPay orders, so that column is blank in the SUB tables.
 - CC fraud-blocked orders excluded from the success-rate denominator
 - TRY orders are excluded from BUY and SUB: any order in `cdc.TbybOrders_v`, or with a TRY auth (`TransactionType=7`) in the window. Without this, TRY shipping and post-trial charges that have no Spreedly metadata (PayPal) fell through the `'BUY'` fallback. The TRY checkouts still coming in are customers completing old carts saved in their browser; they are immaterial and not reported.
 - `OrdersNew_v.PrepaidConverted` orders are still excluded from BUY (the flow ended with TRY; ~20% approval would add noise)
-- SUB is restricted to the first billing attempt (`subscriptions.SubscriptionsRecurringOrders_v.AttemptsAmount = 1`)
-- SUB Blended takes every SUB order. Each retry is its own recurring order ID charged on a single day, so each order counts once on its processing date. The blended rate sits far below the first-attempt rate: on 24 Sep, 1,029 first attempts approved at 58.9% and 2,208 retries at ~3.9%, so 3,237 orders were approved at 21.4%. It moves with the retry mix as well as with payments health.
+- SUB is restricted to **attempt 1 of billing cycle 1**. When a cycle fails all 6 attempts, the next month restarts at `AttemptsAmount = 1` with the **same** `RecurringNumber`, so `AttemptsAmount = 1` alone also picked up cycle 2 and 3 restarts (~18% of attempt-1 orders, 2 to 5% approval). Cycle 1 = the first `AttemptsAmount = 1` order for a (`SubscriptionId`, `RecurringNumber`), over full history. Restarts stay in SUB Blended. Changed on 26 Sep 2026: on 24 Sep this moved SUB from 1,029 orders at 58.9% to 812 at 73.9%.
+- `subscriptions.SubscriptionsRecurringOrders_v` carries duplicate rows (~37% of `RecurringOrderId`s); the query deduplicates before use.
+- SUB Blended takes every SUB order. Each retry is its own recurring order ID charged on a single day, so each order counts once on its processing date. The blended rate sits far below the first-attempt rate: on 24 Sep, 812 cycle-1 first attempts approved at 73.9% and 2,425 retries and restarts at ~3.8%, so 3,237 orders were approved at 21.4%. It moves with the retry mix as well as with payments health.
 
 Common across all funnels:
 - Source: `cdc.PaymentTransactions_v` `LEFT JOIN spreedly.transaction_report_v` on `OrchestratorToken`
@@ -92,7 +94,7 @@ Slack `image` blocks require a publicly fetchable HTTPS URL. The Claude Code Rem
 A single PNG with:
 - **Page title:** `Payment Success Rates - YYYY-MM-DD`
 - **Legend:** `Delta vs Last 7d:` followed by colored swatches: `stable / up`, `-1 to -3pp`, `> -3pp drop`, `< 50 orders`
-- **One table per funnel** (BUY Paid, BUY Unpaid, SUB, SUB Blended at the bottom) with rows `Yesterday | Last 7d | MTD | Prev month` and columns `Period | Overall | CC | Apple Pay | PayPal | Δ Overall vs 7d`
+- **One table per funnel** (BUY Paid, BUY Unpaid, SUB, SUB Blended at the bottom) with rows `Yesterday | Last 7d | MTD | Prev month` and columns `Period | Overall | CC | Apple Pay | PayPal | AfterPay | Δ Overall vs 7d`
 - **BUY tables** have three Yesterday rows (`Yest. card success`, `Yest. fraud declines`, `Yest. overall success`) above `Last 7d | MTD | Prev month`
 - **Footer:** paid media share of BUY orders (yesterday vs last 7d)
 

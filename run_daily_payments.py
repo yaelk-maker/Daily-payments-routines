@@ -23,13 +23,11 @@ Usage:
 Expected JSON shape — a list of period rows. Each row has a ``Period`` key
 ("P4. Yesterday", "P3. Last 7d", "P2. MTD (excl yesterday)", "P1. Previous month")
 and the columns produced by the SQL:
-  BuyPaid_Total   / BuyPaid_Overall   / BuyPaid_CC   / BuyPaid_AP   / BuyPaid_PP
-  BuyUnpaid_Total / BuyUnpaid_Overall / BuyUnpaid_CC / BuyUnpaid_AP / BuyUnpaid_PP
-  Sub_Total       / Sub_Overall       / Sub_CC       / Sub_AP       / Sub_PP
-  SubAll_Total    / SubAll_Overall    / SubAll_CC    / SubAll_AP    / SubAll_PP
-  <funnel>_CC_N / <funnel>_AP_N / <funnel>_PP_N  (per-method order counts)
+  <funnel>_Total / <funnel>_Overall / <funnel>_CC / _AP / _PP / _AF
+    for <funnel> in BuyPaid, BuyUnpaid, Sub, SubAll  (AF = AfterPay)
+  <funnel>_CC_N / _AP_N / _PP_N / _AF_N  (per-method order counts)
   BUY only: <funnel>_<m>_Fraud / <funnel>_<m>_TotalSucc / <funnel>_<m>_AllN for
-  <m> in (Overall, CC, AP, PP), with <funnel>_AllOrders as the Overall count
+  <m> in (Overall, CC, AP, PP, AF), with <funnel>_AllOrders as the Overall count
   BuyPaid_Share
 
 TRY was retired on 23 Aug 2026. BUY is split by acquisition source using the
@@ -43,6 +41,9 @@ excluded), Forter fraud declines, and overall success (all orders). Only the
 overall success row is traffic-lighted, against overall success over the last
 7 days. Last 7d / MTD / Prev month show overall success too, so the Δ can be
 read straight off the table.
+
+A payment method with no orders in any period for a table (AfterPay in SUB) is
+left blank rather than shown as n/a.
 """
 
 import json
@@ -68,16 +69,17 @@ PERIOD_FROM_KEY = {
     "P2. MTD (excl yesterday)": "MTD",
     "P1. Previous month":       "Prev month",
 }
-METRICS = [("Overall", "Overall"), ("CC", "CC"), ("AP", "Apple Pay"), ("PP", "PayPal")]
+METRICS = [("Overall", "Overall"), ("CC", "CC"), ("AP", "Apple Pay"), ("PP", "PayPal"),
+           ("AF", "AfterPay")]
 BUY_FUNNELS = {"BuyPaid", "BuyUnpaid"}
 FUNNELS = [
     ("BuyPaid",   "BUY Paid",   "paid media"),
     ("BuyUnpaid", "BUY Unpaid", "no paid media"),
-    ("Sub",       "SUB",        "first attempt only"),
+    ("Sub",       "SUB",        "1st attempt, excl. restarts"),
     ("SubAll",    "SUB Blended", "all attempts incl. retries"),
 ]
 # one column grid for every table so columns line up down the page
-COL_WIDTHS = [0.23, 0.12, 0.11, 0.13, 0.11, 0.18]
+COL_WIDTHS = [0.21, 0.11, 0.10, 0.12, 0.10, 0.11, 0.16]
 MIN_SCORED_ORDERS = 50   # yesterday's per-method cells below this are not scored
 
 # MAËLYS brand palette (semantic traffic-light colors kept for status)
@@ -117,6 +119,7 @@ def _style_table(tbl, n_cols: int, yest_delta_tx: str, yest_rows: int = 1) -> No
         yc = tbl[(i, 0)]
         yc.get_text().set_color(YEST_PERIOD_TX if i == yest_rows else INK)
         yc.get_text().set_fontweight("bold")
+    tbl[(0, n_cols - 1)].get_text().set_fontsize(9)   # two-line delta header
     dc = tbl[(yest_rows, n_cols - 1)]
     dc.get_text().set_color(yest_delta_tx)
     dc.get_text().set_fontweight("bold")
@@ -161,7 +164,7 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
         title += f"  ({note})"
     _title(ax, title)
 
-    col_labels = ["Period"] + [m[1] for m in METRICS] + ["Δ Overall vs 7d"]
+    col_labels = ["Period"] + [m[1] for m in METRICS] + ["Δ Overall\nvs 7d"]
     cell_text, cell_colors = [], []
 
     def n_for(r, code, all_orders):
@@ -169,17 +172,24 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
             return r.get(f"{prefix}_AllOrders") if all_orders else r[f"{prefix}_Total"]
         return r.get(f"{prefix}_{code}_AllN" if all_orders else f"{prefix}_{code}_N")
 
+    # methods with no orders in any period for this table are left blank
+    unused = {c for c, _ in METRICS if c != "Overall"
+              and not any(rows[p].get(f"{prefix}_{c}_N") for p in PERIODS)}
+
+    def fmt(r, code, suffix=""):
+        return "" if code in unused else _pct(r.get(f"{prefix}_{code}{suffix}"))
+
     if is_buy:
         # Row 1: card success, row 2: Forter fraud declines (plain numbers)
         for label, suffix in (("Yest. card success", ""), ("Yest. fraud declines", "_Fraud")):
-            cell_text.append([label] + [_pct(y.get(f"{prefix}_{c}{suffix}")) for c, _ in METRICS] + [""])
+            cell_text.append([label] + [fmt(y, c, suffix) for c, _ in METRICS] + [""])
             cell_colors.append([YEST_SUB_BG] + ["white"] * (len(METRICS) + 1))
         # Row 3: overall success incl. Forter-blocked, scored vs the same metric last 7d
         vals, colors = ["Yest. overall success"], [YEST_PERIOD_BG]
         for code, _ in METRICS:
             v, base = y.get(f"{prefix}_{code}_TotalSucc"), l7.get(f"{prefix}_{code}_TotalSucc")
-            vals.append(_pct(v))
-            colors.append(_score(v, base, n_for(y, code, True)))
+            vals.append(fmt(y, code, "_TotalSucc"))
+            colors.append("white" if code in unused else _score(v, base, n_for(y, code, True)))
         d_txt, d_bg, delta = _delta_cell(y.get(f"{prefix}_Overall_TotalSucc"),
                                          l7.get(f"{prefix}_Overall_TotalSucc"))
         cell_text.append(vals + [d_txt])
@@ -188,9 +198,9 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
     else:
         vals, colors = ["Yesterday"], [YEST_PERIOD_BG]
         for code, _ in METRICS:
-            v, base = y[f"{prefix}_{code}"], l7[f"{prefix}_{code}"]
-            vals.append(_pct(v))
-            colors.append(_score(v, base, n_for(y, code, False)))
+            v, base = y.get(f"{prefix}_{code}"), l7.get(f"{prefix}_{code}")
+            vals.append(fmt(y, code))
+            colors.append("white" if code in unused else _score(v, base, n_for(y, code, False)))
         d_txt, d_bg, delta = _delta_cell(y[f"{prefix}_Overall"], l7[f"{prefix}_Overall"])
         cell_text.append(vals + [d_txt])
         cell_colors.append(colors + [d_bg])
@@ -200,7 +210,7 @@ def render_funnel(ax, prefix: str, short_title: str, rows: dict, note: str = Non
     hist_suffix = "_TotalSucc" if is_buy else ""
     for period in PERIODS[1:]:
         r = rows[period]
-        cell_text.append([period] + [_pct(r.get(f"{prefix}_{c}{hist_suffix}")) for c, _ in METRICS] + [""])
+        cell_text.append([period] + [fmt(r, c, hist_suffix) for c, _ in METRICS] + [""])
         cell_colors.append([PERIOD_BG] + ["white"] * (len(METRICS) + 1))
 
     tbl = ax.table(

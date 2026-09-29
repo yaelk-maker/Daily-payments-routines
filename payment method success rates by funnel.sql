@@ -46,10 +46,15 @@
 --     check."). SUB is merchant-initiated and not Forter-screened.
 --   - SUB = attempt 1 of billing cycle 1 only (the regular monthly charge). A
 --     cycle that fails all 6 attempts restarts next month at AttemptsAmount=1
---     with the SAME RecurringNumber; those restarts (~18% of attempt-1 orders,
---     2-5% approval) and retries 2-6 are excluded. Cycle 1 = the first
+--     with the SAME RecurringNumber; those restarts (25 Sep 2026: 235 of 953 US
+--     attempt-1 orders, 8% approval) and retries 2-6 are excluded. Cycle 1 = the first
 --     AttemptsAmount=1 order per (SubscriptionId, RecurringNumber), full history.
---     SubscriptionsRecurringOrders_v carries duplicate rows; it is deduplicated.
+--     SubscriptionsRecurringOrders_v has one row per subscription billed on an order
+--     (~37% of recurring orders bill 2+ subscriptions). Cycle 1 is decided per
+--     subscription; an order counts if it is attempt 1 of cycle 1 for at least one of
+--     its subscriptions, bucketed by the highest RecurringNumber among those. This is
+--     deterministic: picking one SubscriptionId per order at random moved 1 to 2
+--     orders a day between runs.
 --   - SUB rate = same-day billing success; failed orders enter dunning.
 -- ============================================================
 
@@ -142,19 +147,24 @@ buy_sub_order AS (   -- one row per order x payment method
   WHERE t.capture_type = 'CAPTURE_FULL'
   GROUP BY p.period, t.OrderID, t.pmt_method, t.order_type
 ),
-sub_recurring AS (   -- dedup: the view carries duplicate rows per RecurringOrderId
-  SELECT RecurringOrderId, ANY_VALUE(SubscriptionId) AS SubscriptionId,
+sub_recurring AS (   -- one row per (recurring order, subscription) billed on it
+  SELECT RecurringOrderId, SubscriptionId,
          MAX(AttemptsAmount) AS AttemptsAmount, MAX(RecurringNumber) AS RecurringNumber
   FROM `subscriptions.SubscriptionsRecurringOrders_v`
-  GROUP BY RecurringOrderId
+  GROUP BY RecurringOrderId, SubscriptionId
 ),
-sub_first_attempt AS (   -- attempt 1 of billing cycle 1
+sub_cycle1 AS (   -- attempt 1 of billing cycle 1, per subscription, over full history
   SELECT r.RecurringOrderId, r.RecurringNumber
   FROM sub_recurring r
   JOIN `cdc.OrdersNew_v` o ON o.Id = r.RecurringOrderId
   WHERE r.AttemptsAmount = 1
   QUALIFY ROW_NUMBER() OVER (PARTITION BY r.SubscriptionId, r.RecurringNumber
                              ORDER BY o.OrderCreateDate, r.RecurringOrderId) = 1
+),
+sub_first_attempt AS (   -- order level: cycle 1 for at least one of its subscriptions
+  SELECT RecurringOrderId, MAX(RecurringNumber) AS RecurringNumber
+  FROM sub_cycle1
+  GROUP BY RecurringOrderId
 ),
 funnel_order AS (
   SELECT b.*, f.RecurringNumber,

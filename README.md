@@ -35,7 +35,7 @@ Removed from the daily image by design: Last 7d / MTD / Prev month rows, SUB Ble
 | SUB first attempt | Attempt 1 of billing cycle 1: the regular monthly charge. Retries (attempts 2 to 6) and restarts after a failed month are excluded |
 | Forter blocks | Orders that never succeeded and had at least one attempt blocked by Forter's pre-auth check (Spreedly message "gateway transaction not attempted due to failed pre authorization fraud check.") |
 | Normal | The same metric over the 28 days before yesterday |
-| Expected (SUB) | Σ yesterday's orders per recurring-order group × that group's 28-day rate, ÷ yesterday's orders. It adjusts for mix: 1st recurring orders approve at ~57%, 4th+ at ~82% |
+| Expected (SUB) | Σ yesterday's orders per recurring-order group × that group's 28-day rate, ÷ yesterday's orders. It adjusts for mix: 1st recurring orders approve at ~63%, 4th+ at ~83% (28 days to 24 Sep 2026) |
 
 ## Scoring
 
@@ -62,7 +62,7 @@ Forter blocks are tested the other way: a rise is the warning. A method with no 
   - TRY orders (`cdc.TbybOrders_v`, or any TRY auth in the window). The remaining TRY checkouts are old carts saved in customers' browsers.
   - PrepaidConverted orders.
 - **SUB cycles:** a cycle that fails all 6 attempts restarts next month at `AttemptsAmount = 1` with the **same** `RecurringNumber`. Cycle 1 is therefore the first `AttemptsAmount = 1` order per (`SubscriptionId`, `RecurringNumber`), over full history.
-  - `SubscriptionsRecurringOrders_v` has duplicate rows (~37% of ids) and is deduplicated.
+  - `SubscriptionsRecurringOrders_v` has one row per subscription billed on an order (~37% of recurring orders bill 2 or more). Cycle 1 is decided per subscription; an order counts if it is attempt 1 of cycle 1 for at least one of its subscriptions, and it is bucketed by the highest `RecurringNumber` among those.
   - SUB success is same-day billing success; failed orders enter dunning.
 
 ## Reconciliation with the Analysis report (24 Sep 2026, US)

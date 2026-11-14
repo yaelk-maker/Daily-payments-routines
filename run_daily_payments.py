@@ -25,7 +25,8 @@ Expected JSON shape — a list of rows with keys
   dim, n, k
 where dim is 'Overall' (n attempted, k completed), 'CC' / 'AP' / 'PP' / 'AF'
 (BUY, per payment method), 'Forter' (BUY, k = Forter-declined orders) or
-'RN1' / 'RN2-3' / 'RN4+' (SUB, by recurring order number).
+'RN1' / 'RN2-3' / 'RN4+' and 'CC' / 'AP' / 'PP' (SUB, by recurring order number
+and by payment method).
 
 Scoring: yesterday is compared with the previous 28 days ("normal"). A cell is
 coloured only when a move that bad is unlikely to be chance at yesterday's
@@ -57,6 +58,7 @@ GITHUB_OWNER_REPO = "yaelk-maker/Daily-payments-routines"
 BUY_SEGMENTS = [("BuyPaid", "Paid"), ("BuyUnpaid", "Unpaid")]
 METHODS      = [("CC", "Card"), ("AP", "Apple Pay"), ("PP", "PayPal"), ("AF", "AfterPay")]
 SUB_BUCKETS  = [("RN1", "1st recurring order"), ("RN2-3", "2nd to 3rd"), ("RN4+", "4th+")]
+SUB_METHODS  = [("CC", "Card"), ("AP", "Apple Pay"), ("PP", "PayPal")]
 AMBER_P, RED_P = 0.0228, 0.00135
 
 # MAËLYS brand palette (semantic traffic-light colors kept for status)
@@ -115,7 +117,7 @@ def build_model(cells: dict) -> dict:
             return "ok"
         return status(tail_p(y[1], y[0], base, upper=upper))
 
-    m = {"tiles": [], "buy": {}, "sub": [], "flags": []}
+    m = {"tiles": [], "buy": {}, "sub": [], "sub_pm": [], "flags": []}
 
     # headline tiles: BUY vs its 28-day rate, SUB vs the rate expected for yesterday's mix
     for seg, label in (("BuyPaid", "BUY Paid"), ("BuyUnpaid", "BUY Unpaid")):
@@ -162,6 +164,16 @@ def build_model(cells: dict) -> dict:
         if st in ("amber", "red"):
             m["flags"].append((st, f"SUB {name} approval: {rate(y)*100:.1f}% vs {base*100:.1f}% "
                                    f"normal ({y[0]} attempts)"))
+
+    # SUB by payment method
+    for code, name in SUB_METHODS:
+        y = get("Y", "Sub", code)
+        base = rate(get("B28", "Sub", code))
+        st = score(y, base)
+        m["sub_pm"].append(dict(name=name, v=rate(y), base=base, n=y[0], k=y[1], st=st))
+        if st in ("amber", "red"):
+            m["flags"].append((st, f"SUB {name.lower() if code == 'CC' else name} approval: "
+                                   f"{rate(y)*100:.1f}% vs {base*100:.1f}% normal ({y[0]} attempts)"))
     return m
 
 
@@ -260,22 +272,23 @@ def generate_image(cells: dict, report_date: str, out_path: Path) -> None:
                "Tiles count each order once.", fontsize=8.5, color=NEU2, style="italic")
     y0 -= 6.5
 
-    # SUB by recurring order number
-    section(y0, "SUB first attempt by recurring order",
-            "regular monthly charge, failed-month restarts excluded")
-    y0 -= 5.5
+    # SUB by recurring order number, then by payment method
+    section(y0, "SUB first attempt by recurring order and payment method",
+            "failed-month restarts excluded")
     pw = 29.7
     xs = [4 + i * (pw + 1.45) for i in range(3)]
-    header(y0, xs, pw, [s["name"] for s in m["sub"]])
-    y0 -= 6.2
-    y0 -= 2
-    for x, s in zip(xs, m["sub"]):
-        box(x, y0, pw, 7.6, FILL[s["st"]], r=0.6)
-        txt(x + pw / 2, y0 + 5.4, _pct(s["v"]) if s["n"] else "no orders", ha="center", fontsize=11)
-        txt(x + pw / 2, y0 + 3.2, f"normal {_pct(s['base'])}", ha="center", fontsize=8, color=NEU2)
-        txt(x + pw / 2, y0 + 1.3, f"{s['n']:,} attempts  ·  {s['k']:,} completed",
-            ha="center", fontsize=8, color=NEU2)
-    y0 -= 5
+    for group in (m["sub"], m["sub_pm"]):
+        y0 -= 5.5
+        header(y0, xs, pw, [s["name"] for s in group])
+        y0 -= 8.2
+        for x, s in zip(xs, group):
+            box(x, y0, pw, 7.6, FILL[s["st"]], r=0.6)
+            txt(x + pw / 2, y0 + 5.4, _pct(s["v"]) if s["n"] else "no orders", ha="center", fontsize=11)
+            txt(x + pw / 2, y0 + 3.2, f"normal {_pct(s['base'])}", ha="center", fontsize=8, color=NEU2)
+            txt(x + pw / 2, y0 + 1.3, f"{s['n']:,} attempts  ·  {s['k']:,} completed",
+                ha="center", fontsize=8, color=NEU2)
+        y0 -= 0.5
+    y0 -= 4.5
 
     # legend
     ax.plot([4, 96], [y0, y0], color=LINE, lw=1)

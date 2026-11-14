@@ -10,8 +10,8 @@
 --                                        tried the method, k = approved on it
 --             'Forter'                   (BUY) n = orders, k = Forter-declined orders
 --             'RN1' | 'RN2-3' | 'RN4+'   (SUB) by recurring order number
---             'CC' | 'AP' | 'PP'         (SUB) per payment method, n = orders that
---                                        tried the method, k = approved on it
+--             'RN1|CC' ... 'RN4+|PP'     (SUB) recurring order group x payment method,
+--                                        n = orders that tried the method, k = approved on it
 --   report_date = yesterday
 -- The image computes every rate as k / n and scores yesterday against B28 with
 -- an exact binomial test, so no rounding happens in SQL.
@@ -192,8 +192,11 @@ long AS (
     COUNT(*), COUNTIF(success=1)
   FROM order_level WHERE segment = 'Sub' GROUP BY 1, 2, 3
   UNION ALL
-  SELECT period, segment, pmt_method, COUNT(*), COUNTIF(success=1)
-  FROM funnel_order WHERE segment = 'Sub' GROUP BY period, segment, pmt_method
+  SELECT period, segment,
+    CONCAT(CASE WHEN RecurringNumber >= 4 THEN 'RN4+' WHEN RecurringNumber >= 2 THEN 'RN2-3' ELSE 'RN1' END,
+           '|', pmt_method),
+    COUNT(*), COUNTIF(success=1)
+  FROM funnel_order WHERE segment = 'Sub' GROUP BY 1, 2, 3
 )
 SELECT (SELECT yesterday FROM params) AS report_date, period, segment, dim, n, k
 FROM long

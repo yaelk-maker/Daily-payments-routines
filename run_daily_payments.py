@@ -25,8 +25,8 @@ Expected JSON shape — a list of rows with keys
   dim, n, k
 where dim is 'Overall' (n attempted, k completed), 'CC' / 'AP' / 'PP' / 'AF'
 (BUY, per payment method), 'Forter' (BUY, k = Forter-declined orders) or
-'RN1' / 'RN2-3' / 'RN4+' and 'CC' / 'AP' / 'PP' (SUB, by recurring order number
-and by payment method).
+'RN1' / 'RN2-3' / 'RN4+' (SUB, by recurring order number; used for the SUB tile's
+expected rate) and 'RN1|CC' ... 'RN4+|PP' (SUB, recurring order group x payment method).
 
 Scoring: yesterday is compared with the previous 28 days ("normal"). A cell is
 coloured only when a move that bad is unlikely to be chance at yesterday's
@@ -117,7 +117,7 @@ def build_model(cells: dict) -> dict:
             return "ok"
         return status(tail_p(y[1], y[0], base, upper=upper))
 
-    m = {"tiles": [], "buy": {}, "sub": [], "sub_pm": [], "flags": []}
+    m = {"tiles": [], "buy": {}, "sub": {}, "flags": []}
 
     # headline tiles: BUY vs its 28-day rate, SUB vs the rate expected for yesterday's mix
     for seg, label in (("BuyPaid", "BUY Paid"), ("BuyUnpaid", "BUY Unpaid")):
@@ -155,25 +155,19 @@ def build_model(cells: dict) -> dict:
                                    f"vs {base*100:.1f}% normal"))
         m["buy"][label] = row
 
-    # SUB by recurring order number
-    for code, name in SUB_BUCKETS:
-        y = get("Y", "Sub", code)
-        base = rate(get("B28", "Sub", code))
-        st = score(y, base)
-        m["sub"].append(dict(name=name, v=rate(y), base=base, n=y[0], k=y[1], st=st))
-        if st in ("amber", "red"):
-            m["flags"].append((st, f"SUB {name} approval: {rate(y)*100:.1f}% vs {base*100:.1f}% "
-                                   f"normal ({y[0]} attempts)"))
-
-    # SUB by payment method
-    for code, name in SUB_METHODS:
-        y = get("Y", "Sub", code)
-        base = rate(get("B28", "Sub", code))
-        st = score(y, base)
-        m["sub_pm"].append(dict(name=name, v=rate(y), base=base, n=y[0], k=y[1], st=st))
-        if st in ("amber", "red"):
-            m["flags"].append((st, f"SUB {name.lower() if code == 'CC' else name} approval: "
-                                   f"{rate(y)*100:.1f}% vs {base*100:.1f}% normal ({y[0]} attempts)"))
+    # SUB by recurring order group x payment method
+    for bucket, bname in SUB_BUCKETS:
+        row = []
+        for code, name in SUB_METHODS:
+            y = get("Y", "Sub", f"{bucket}|{code}")
+            base = rate(get("B28", "Sub", f"{bucket}|{code}"))
+            st = score(y, base)
+            row.append(dict(v=rate(y), base=base, n=y[0], k=y[1], st=st))
+            if st in ("amber", "red"):
+                m["flags"].append((st, f"SUB {bname}, {name.lower() if code == 'CC' else name}: "
+                                       f"{rate(y)*100:.1f}% vs {base*100:.1f}% normal "
+                                       f"({y[0]} attempts)"))
+        m["sub"][bname] = row
     return m
 
 
@@ -275,20 +269,23 @@ def generate_image(cells: dict, report_date: str, out_path: Path) -> None:
     # SUB by recurring order number, then by payment method
     section(y0, "SUB first attempt by recurring order and payment method",
             "failed-month restarts excluded")
-    pw = 29.7
-    xs = [4 + i * (pw + 1.45) for i in range(3)]
-    for group in (m["sub"], m["sub_pm"]):
-        y0 -= 5.5
-        header(y0, xs, pw, [s["name"] for s in group])
+    y0 -= 5.5
+    lw_ = 18
+    pw = (96 - 4 - lw_ - 0.6 * 3) / 3
+    xs = [4 + lw_ + 0.6 + i * (pw + 0.6) for i in range(3)]
+    header(y0, xs, pw, [name for _, name in SUB_METHODS])
+    y0 -= 0.6
+    for bname, row in m["sub"].items():
         y0 -= 8.2
-        for x, s in zip(xs, group):
-            box(x, y0, pw, 7.6, FILL[s["st"]], r=0.6)
-            txt(x + pw / 2, y0 + 5.4, _pct(s["v"]) if s["n"] else "no orders", ha="center", fontsize=11)
-            txt(x + pw / 2, y0 + 3.2, f"normal {_pct(s['base'])}", ha="center", fontsize=8, color=NEU2)
-            txt(x + pw / 2, y0 + 1.3, f"{s['n']:,} attempts  ·  {s['k']:,} completed",
+        box(4, y0, lw_, 7.6, PINK_L, ec="none", r=0.6)
+        txt(4 + lw_ / 2, y0 + 3.8, bname, ha="center", fontsize=10, fontweight="bold")
+        for x, c in zip(xs, row):
+            box(x, y0, pw, 7.6, FILL[c["st"]], r=0.6)
+            txt(x + pw / 2, y0 + 5.4, _pct(c["v"]) if c["n"] else "no orders", ha="center", fontsize=11)
+            txt(x + pw / 2, y0 + 3.2, f"normal {_pct(c['base'])}", ha="center", fontsize=8, color=NEU2)
+            txt(x + pw / 2, y0 + 1.3, f"{c['n']:,} attempts  ·  {c['k']:,} completed",
                 ha="center", fontsize=8, color=NEU2)
-        y0 -= 0.5
-    y0 -= 4.5
+    y0 -= 5
 
     # legend
     ax.plot([4, 96], [y0, y0], color=LINE, lw=1)

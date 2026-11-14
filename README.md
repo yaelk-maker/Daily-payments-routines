@@ -18,7 +18,7 @@
 | **Banner** | "All normal" in green, or one line per unusual cell (amber) or very unusual cell (red, listed first) |
 | **Headline tiles** | BUY Paid, BUY Unpaid, SUB first attempt: yesterday's success rate, its normal, the change in pp, and `attempts · completed` |
 | **BUY approval by payment method** | Paid and Unpaid × Card, Apple Pay, PayPal, AfterPay, plus Forter blocks. Each cell shows yesterday, its normal and yesterday's order count |
-| **SUB first attempt by recurring order** | 1st recurring order, 2nd to 3rd, 4th+ |
+| **SUB first attempt by recurring order and payment method** | Rows 1st recurring order, 2nd to 3rd, 4th+ × columns Card, Apple Pay, PayPal. Each cell shows yesterday, its normal, attempts and completed |
 
 Removed from the daily image by design: Last 7d / MTD / Prev month rows, SUB Blended (retries), and the per-processor view. Trend and retry recovery belong in a weekly review, and processor outages in an hourly alert.
 
